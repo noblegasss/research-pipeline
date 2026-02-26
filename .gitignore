@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/.turbo/
+web/.cache/
+
+# Runtime data
+paper_archive.db
+reports/
+notes/
+notes_meta.json
+
+# Local configs / secrets
+pipeline_config.json
+.env
+.env.*
+!.env.example
+.claude/
+
+# Logs
+*.log
