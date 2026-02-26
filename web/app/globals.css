@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f5f4ef;
+  --background-elev: #fcfbf8;
+  --foreground: #1f1d1a;
+  --sidebar-bg: #f3f1ea;
+  --sidebar-border: #dfdbd0;
+  --card-border: #e4e0d7;
+  --accent: #225ea8;
+  --accent-soft: #e7effa;
+  --muted: #7d776f;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --shadow-1: 0 1px 2px rgba(18, 16, 12, 0.05), 0 8px 24px rgba(18, 16, 12, 0.06);
+  --shadow-2: 0 1px 2px rgba(18, 16, 12, 0.06), 0 14px 30px rgba(18, 16, 12, 0.11);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background:
+    radial-gradient(1100px 520px at 82% -20%, #ece8dc 0%, transparent 62%),
+    radial-gradient(900px 460px at -18% 20%, #ece9e0 0%, transparent 56%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  letter-spacing: 0.01em;
+  text-rendering: optimizeLegibility;
+}
+
+/* Markdown prose styles */
+.prose h1, .prose h2, .prose h3 {
+  font-weight: 650;
+  margin-top: 1.05em;
+  margin-bottom: 0.5em;
+  color: #1f1d1a;
+  letter-spacing: -0.01em;
+}
+.prose h1 { font-size: 1.55rem; }
+.prose h2 { font-size: 1.22rem; }
+.prose h3 { font-size: 1.05rem; }
+.prose p { margin: 0.58em 0; line-height: 1.75; color: #312e2a; }
+.prose ul { padding-left: 1.5em; margin: 0.5em 0; list-style-type: disc; }
+.prose ol { padding-left: 1.5em; margin: 0.5em 0; list-style-type: decimal; }
+.prose ul ul { list-style-type: circle; }
+.prose ul ul ul { list-style-type: square; }
+.prose li { margin: 0.25em 0; }
+.prose img { max-width: 100%; height: auto; border-radius: 10px; box-shadow: var(--shadow-1); margin: 0.9em 0; border: 1px solid #e8e4dc; }
+.prose code { background: #f0eee7; padding: 1px 5px; border-radius: 5px; font-size: 0.85em; }
+.prose pre { background: #f7f6f1; padding: 12px; border-radius: 10px; overflow-x: auto; border: 1px solid #e7e3da; }
+.prose pre code { background: none; padding: 0; }
+.prose blockquote { border-left: 3px solid #d9d2c5; padding-left: 12px; color: #6b655d; background: #f7f4ee; border-radius: 0 8px 8px 0; }
+.prose strong { font-weight: 650; color: #201e1b; }
+.prose a { color: var(--accent); text-decoration: none; }
+.prose a:hover { text-decoration: underline; }
+.prose hr { border-color: #e5dfd4; margin: 1.15em 0; }
+
+button,
+input,
+select,
+textarea {
+  transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 120ms ease;
+}
+
+button:active {
+  transform: translateY(0.5px);
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(34, 94, 168, 0.2);
+}
+
+.app-panel {
+  background: color-mix(in oklab, var(--background-elev) 90%, white 10%);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-1);
+}
+
+/* Notes page typography: keep scale stable and predictable */
+.note-prose {
+  font-size: 15px;
+  line-height: 1.75;
+  color: #3d3a37;
+}
+.note-prose h1,
+.note-prose h2,
+.note-prose h3 {
+  font-weight: 600;
+  color: #1f1d1a;
+  line-height: 1.35;
+}
+.note-prose h1 {
+  font-size: 1.7rem;
+  font-weight: 700;
+  margin-top: 0.1rem;
+  margin-bottom: 1rem;
+  letter-spacing: -0.01em;
+}
+.note-prose h2 {
+  font-size: 1.18rem;
+  margin-top: 1.5rem;
+  margin-bottom: 0.55rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid #e2e0da;
+}
+.note-prose h3 {
+  font-size: 1.02rem;
+  margin-top: 1rem;
+  margin-bottom: 0.45rem;
+  color: #3d3a37;
+}
+.note-prose p,
+.note-prose li {
+  font-size: 0.98rem;
+}
+.note-prose code {
+  font-size: 0.92em;
+}
+.note-prose pre code {
+  font-size: 0.9rem;
+}
+.note-prose .katex {
+  font-size: 1em;
+}
+.note-prose .katex-display {
+  font-size: 1.05em;
+  margin: 0.95em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cfc9bd; border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
