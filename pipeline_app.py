@@ -18,9 +18,8 @@ from typing import Any
 
 import streamlit as st
 
-# Allow importing app.py from the research_push sibling directory.
-# When this file lives at  <Dropbox>/research_pipeline/pipeline_app.py,
-# parent.parent is <Dropbox>/ and we look for the sibling research_push folder.
+# Allow importing app.py from a sibling research_push directory.
+# If your folder layout differs, set RESEARCH_PUSH_ROOT explicitly.
 # Override with env var RESEARCH_PUSH_ROOT if the layout is different.
 import os as _os
 _ROOT = Path(_os.environ.get(
