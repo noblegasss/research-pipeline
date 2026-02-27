@@ -19,6 +19,10 @@ web/.cache/
 
 # Runtime data
 paper_archive.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 reports/
 notes/
 notes_meta.json
@@ -29,6 +33,8 @@ pipeline_config.json
 .env.*
 !.env.example
 .claude/
+.idea/
+.vscode/
 
 # Logs
 *.log

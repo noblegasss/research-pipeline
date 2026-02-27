@@ -1088,61 +1088,79 @@ def _generate_deep_md(
             "supplementary", "appendix",
         }
 
-        def _score(fig: dict[str, str]) -> int:
+        def _score_breakdown(fig: dict[str, str]) -> tuple[int, int, int]:
+            """Returns (method_score, result_score, total_score)."""
             cap = str(fig.get("caption", "") or "").lower()
             url = str(fig.get("url", "") or "").lower()
             src = str(fig.get("source", "") or "").lower()
             text = f"{cap} {url}"
-            score = 0
+            m_score = 0
+            r_score = 0
 
             for t in method_terms_strong:
                 if t in text:
-                    score += 6
+                    m_score += 6
             for t in method_terms_mod:
                 if t in text:
-                    score += 3
+                    m_score += 3
             for t in result_terms:
                 if t in text:
-                    score += 2  # result figures are now also valid to embed
+                    r_score += 4
             for t in non_method_terms:
                 if t in text:
-                    score -= 3
+                    m_score -= 3
+                    r_score -= 3
 
-            # Bonus when caption explicitly says "our" / "we propose" — strong method signal
             if re.search(r"\b(our|we propose|proposed method|proposed framework)\b", cap):
-                score += 5
+                m_score += 5
 
-            # Overlap with paper method context keywords
             fig_tokens = set(re.findall(r"[a-z][a-z0-9_-]{3,}", text))
             overlap = len((fig_tokens & ctx_tokens) - stop)
-            score += min(overlap * 2, 12)  # doubled weight, higher cap
+            m_score += min(overlap * 2, 12)
 
-            # Figure number heuristics: Fig 2-5 are prime method territory
             fig_num_m = re.search(r"(?:figure|fig)[.\s]*(\d+)", cap)
             if fig_num_m:
                 n = int(fig_num_m.group(1))
                 if 2 <= n <= 5:
-                    score += 3
+                    m_score += 2
                 elif n == 1:
-                    score -= 2  # Fig 1 is usually teaser/motivation
+                    m_score -= 2
+                    r_score -= 1
                 elif n >= 8:
-                    score -= 1  # late figures often results/supplementary
+                    m_score -= 1
 
-            # Prefer richer-caption sources over raw PDF image dumps.
             if src in {"arxiv", "html"}:
-                score += 3
+                m_score += 2
+                r_score += 2
             elif src.startswith("pdf"):
-                score -= 1
-            # Penalize generic PDF captions (usually weakly informative).
+                m_score -= 1
+                r_score -= 1
             if re.search(r"^pdf figure\s*\d+", cap):
-                score -= 4
-            return score
+                m_score -= 4
+                r_score -= 4
 
-        ranked = sorted(figs, key=_score, reverse=True)
+            total = max(m_score, r_score)
+            return m_score, r_score, total
+
+        def _classify(fig: dict[str, str]) -> str:
+            m, r, _ = _score_breakdown(fig)
+            if m <= 0 and r <= 0:
+                return "unknown"
+            if r > m:
+                return "result"
+            return "method"
+
+        def _total_score(fig: dict[str, str]) -> int:
+            return _score_breakdown(fig)[2]
+
+        for fig in figs:
+            fig["fig_type"] = _classify(fig)
+
+        ranked = sorted(figs, key=_total_score, reverse=True)
         return ranked
 
     def _ai_reorder_figures_for_method(figs: list[dict[str, str]]) -> list[dict[str, str]]:
-        """Use AI to pick the most method-relevant figures (best-effort)."""
+        """Use AI to pick and classify figures as method or result (best-effort)."""
         if not figs or len(figs) < 2 or not api_key.strip():
             return figs
         try:
@@ -1153,16 +1171,18 @@ def _generate_deep_md(
                     "index": i,
                     "caption": str(f.get("caption", "") or ""),
                     "source": str(f.get("source", "") or ""),
+                    "heuristic_type": str(f.get("fig_type", "unknown")),
                     "url_hint": str(f.get("url", "") or "")[:120],
                 })
             methods_text = str(report.get("methods_detailed", "") or "")[:600]
             sys_prompt = (
-                "You are selecting figures for a paper review. "
-                "Choose figures that belong in either:\n"
-                "  (a) Method section: architecture/pipeline/framework/module diagrams\n"
-                "  (b) Results section: key quantitative or qualitative results of the paper's own method\n"
-                "AVOID: motivation figures (usually Fig 1), related-work illustrations, dataset overview, supplementary.\n"
-                "Return ONLY JSON: {\"indices\":[...]} with 1-based indices ordered by relevance, max 3 items."
+                "You are selecting and classifying figures for a paper review.\n"
+                "For each selected figure, assign a type:\n"
+                "  'method': architecture/pipeline/framework/module diagrams — shows HOW the method works\n"
+                "  'result': quantitative tables, plots, or qualitative comparisons — shows HOW WELL it works\n"
+                "SKIP: motivation figures (usually Fig 1), related-work, dataset overview, supplementary.\n"
+                "Select at most 1 method figure and 1 result figure (2 total). "
+                "Return ONLY JSON: {\"picks\": [{\"index\": N, \"type\": \"method\"|\"result\"}, ...]}"
             )
             payload = {
                 "title": title,
@@ -1176,32 +1196,40 @@ def _generate_deep_md(
                 model=model.strip() or _default_model_for_provider(_normalize_api_provider(api_provider)),
                 system_prompt=sys_prompt,
                 user_content=json.dumps(payload, ensure_ascii=False),
-                max_output_tokens=120,
+                max_output_tokens=160,
                 timeout=12,
             )
             s = raw.strip()
             if "{" in s and "}" in s:
                 s = s[s.find("{"): s.rfind("}") + 1]
             obj = json.loads(s)
-            idxs_raw = obj.get("indices", [])
-            if not isinstance(idxs_raw, list):
+            picks_raw = obj.get("picks", [])
+            if not isinstance(picks_raw, list):
                 return figs
-            picked: list[int] = []
-            for x in idxs_raw:
+            seen_method = seen_result = False
+            head: list[dict[str, str]] = []
+            used: set[int] = set()
+            for item in picks_raw:
                 try:
-                    iv = int(x)
+                    iv = int(item.get("index", 0))
+                    ftype = str(item.get("type", "")).strip().lower()
                 except Exception:
                     continue
-                if 1 <= iv <= len(figs) and iv not in picked:
-                    picked.append(iv)
-                if len(picked) >= 3:
-                    break
-            if not picked:
+                if not (1 <= iv <= len(figs)):
+                    continue
+                if ftype == "method" and not seen_method:
+                    figs[iv - 1]["fig_type"] = "method"
+                    head.append(figs[iv - 1])
+                    used.add(iv)
+                    seen_method = True
+                elif ftype == "result" and not seen_result:
+                    figs[iv - 1]["fig_type"] = "result"
+                    head.append(figs[iv - 1])
+                    used.add(iv)
+                    seen_result = True
+            if not head:
                 return figs
-            # Return ONLY the AI-selected figures first, then remaining
-            picked_set = set(picked)
-            head = [figs[i - 1] for i in picked]
-            tail = [f for j, f in enumerate(figs, start=1) if j not in picked_set]
+            tail = [f for j, f in enumerate(figs, start=1) if j not in used]
             return head + tail
         except Exception:
             return figs
@@ -1299,31 +1327,39 @@ def _generate_deep_md(
         try:
             client = _make_openai_compatible_client(api_provider, api_key)
 
-            # Build figure reference block for the prompt
+            # Build figure reference block for the prompt, grouped by pre-classified type
             if figures_data:
-                fig_ref_lines = []
-                for i, f in enumerate(figures_data[:4]):
-                    cap = f["caption"] or f"Figure {i+1}"
-                    fig_ref_lines.append(f"Figure {i+1}: {cap}\nURL: {_prompt_safe_figure_url(str(f.get('url', '')))}")
-                fig_instructions = (
-                    "\n\nAVAILABLE FIGURES (candidates, ranked by estimated method relevance):\n"
-                    + "\n\n".join(fig_ref_lines)
-                    + "\n\nFIGURE EMBEDDING RULES (strict — read carefully):\n"
-                    "- Allowed placement: '## Method Details' (architecture/pipeline/framework diagrams) "
-                    "or '## Main Results' (key result plots that clearly support the paper's main claims). "
-                    "Match each figure to the section it best belongs to.\n"
-                    "- Only embed a figure if you are CONFIDENT it belongs: "
-                    "method figures show the paper's own architecture/pipeline/module design; "
-                    "result figures show the paper's own key quantitative or qualitative findings. "
-                    "When in doubt, DO NOT embed it.\n"
-                    "- NEVER embed: motivation/background figures, related-work illustrations, "
-                    "dataset overview figures, or supplementary figures.\n"
-                    "- If NONE of the available figures clearly fit either section, embed NOTHING — text-only is fine.\n"
-                    "- Embed at most 2 figures total across the entire review.\n"
-                    "- Place each figure immediately after the paragraph it illustrates.\n"
-                    "- Syntax: ![Figure N: caption](url)\n"
-                    "- Do NOT create a standalone figures section.\n"
-                )
+                method_figs = [(i + 1, f) for i, f in enumerate(figures_data[:6])
+                               if f.get("fig_type") == "method"][:1]
+                result_figs = [(i + 1, f) for i, f in enumerate(figures_data[:6])
+                               if f.get("fig_type") == "result"][:1]
+                fig_blocks: list[str] = []
+                if method_figs:
+                    lines = []
+                    for i, f in method_figs:
+                        cap = f.get("caption") or f"Figure {i}"
+                        lines.append(f"Figure {i} [METHOD]: {cap}\nURL: {_prompt_safe_figure_url(str(f.get('url', '')))}")
+                    fig_blocks.append("METHOD FIGURE (embed inside ## Method Details):\n" + "\n\n".join(lines))
+                if result_figs:
+                    lines = []
+                    for i, f in result_figs:
+                        cap = f.get("caption") or f"Figure {i}"
+                        lines.append(f"Figure {i} [RESULT]: {cap}\nURL: {_prompt_safe_figure_url(str(f.get('url', '')))}")
+                    fig_blocks.append("RESULT FIGURE (embed inside ## Main Results):\n" + "\n\n".join(lines))
+
+                if fig_blocks:
+                    fig_instructions = (
+                        "\n\nPRE-CLASSIFIED FIGURES — embed each in its designated section:\n\n"
+                        + "\n\n".join(fig_blocks)
+                        + "\n\nFIGURE EMBEDDING RULES:\n"
+                        "- Embed each figure in the section shown above — METHOD figure in '## Method Details', "
+                        "RESULT figure in '## Main Results'.\n"
+                        "- Place immediately after the paragraph it best illustrates.\n"
+                        "- Syntax: ![Figure N: caption](url)\n"
+                        "- Do NOT create a standalone figures section.\n"
+                    )
+                else:
+                    fig_instructions = ""
             else:
                 fig_instructions = ""
 
@@ -1424,28 +1460,25 @@ def _generate_deep_md(
             md_body = md_body[len(first_line):].lstrip("\n")
     md_body = _normalize_math_delimiters(md_body)
     md_body = _repair_image_links(md_body, figures_data)
-    # If AI output omitted images but we found figures, inline the most relevant one.
+    # If AI output omitted images but we found classified figures, inject them by type.
     if figures_data and "![" not in md_body:
-        fig = figures_data[0]
-        cap = fig.get("caption") or "Figure 1"
-        fig_block = f"![Figure 1: {cap}]({fig['url']})"
-        cap_lower = cap.lower()
-        _result_kw = {"performance", "accuracy", "comparison", "benchmark",
-                      "auroc", "auc", "f1", "precision", "recall", "roc",
-                      "result", "table", "score", "improvement", "gain",
-                      "ablation", "evaluation"}
-        _method_kw = {"architecture", "framework", "pipeline", "overview",
-                      "diagram", "schematic", "illustration", "workflow",
-                      "proposed", "model", "network", "module", "structure"}
-        result_hits = sum(1 for w in _result_kw if w in cap_lower)
-        method_hits = sum(1 for w in _method_kw if w in cap_lower)
-        target_section = r"##\s+Main Results" if result_hits > method_hits else r"##\s+Method Details"
-        md_body = re.sub(
-            rf"(?ms)({target_section}[^\n]*\n)",
-            r"\1\n" + fig_block + "\n\n",
-            md_body,
-            count=1,
-        )
+        method_fig = next((f for f in figures_data if f.get("fig_type") == "method"), None)
+        result_fig = next((f for f in figures_data if f.get("fig_type") == "result"), None)
+        for fig, section_pat in [
+            (method_fig, r"##\s+Method Details"),
+            (result_fig, r"##\s+Main Results"),
+        ]:
+            if not fig:
+                continue
+            cap = fig.get("caption") or ""
+            label = "Figure"
+            block = f"![{label}: {cap}]({fig['url']})"
+            md_body = re.sub(
+                rf"(?ms)({section_pat}[^\n]*\n)",
+                r"\1\n" + block + "\n\n",
+                md_body,
+                count=1,
+            )
 
     # Fallback: render from existing report fields
     if not md_body:
