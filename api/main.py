@@ -1619,6 +1619,57 @@ def _generate_deep_md(
     return md
 
 
+def _localize_external_images(
+    md: str,
+    date_str: str,
+    day_dir: Path,
+    slug: str,
+    log_cb: Any | None = None,
+) -> str:
+    """Download external HTTPS image URLs embedded in markdown to local assets."""
+    import urllib.request as _ur
+
+    ext_img_pat = re.compile(
+        r'(!\[[^\]]*\]\()(https?://[^\s)]+\.(?:png|jpg|jpeg|webp|gif)(?:\?[^)]*)?)\)',
+        re.IGNORECASE,
+    )
+    if not ext_img_pat.search(md):
+        return md
+
+    assets_dir = day_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    seen: dict[str, str] = {}
+    fig_idx = [0]
+
+    def _repl(m: re.Match) -> str:
+        prefix = m.group(1)
+        url = m.group(2)
+        if url in seen:
+            return f"{prefix}{seen[url]})"
+        try:
+            req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+            with _ur.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            if not data:
+                return m.group(0)
+            ext = Path(url.split("?")[0]).suffix.lower()
+            if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                ext = ".png"
+            fig_idx[0] += 1
+            fname = f"{slug}_ext{fig_idx[0]}_{hashlib.sha256(data).hexdigest()[:10]}{ext}"
+            (assets_dir / fname).write_bytes(data)
+            local_url = f"/api/reports/{date_str}/assets/{fname}"
+            seen[url] = local_url
+            if callable(log_cb):
+                log_cb(f"🖼️ Cached external figure: {fname}")
+            return f"{prefix}{local_url})"
+        except Exception:
+            return m.group(0)
+
+    return ext_img_pat.sub(_repl, md)
+
+
 def _externalize_data_uri_images(
     md: str,
     date_str: str,
@@ -1686,6 +1737,55 @@ def _externalize_data_uri_images(
     return pattern.sub(_repl, md)
 
 
+def _write_digest_md(
+    date_str: str,
+    report_cards: list[dict[str, Any]],
+    also_notable: list[dict[str, Any]],
+    day_dir: Path,
+) -> None:
+    """Write/overwrite digest.md for a given date from current report_cards + also_notable."""
+    total = len(report_cards) + len(also_notable)
+    lines: list[str] = [
+        f"# 📚 Research Digest | {date_str}\n\n",
+        f"**{total}** papers fetched · **{len(report_cards)}** deep reads · **{len(also_notable)}** also notable\n\n",
+        "---\n\n",
+        "## Deep Reads\n\n",
+    ]
+    for rc in report_cards:
+        title = rc.get("title", "")
+        venue = rc.get("venue", "")
+        date = rc.get("date", "")
+        link = rc.get("link", "") or _best_link(rc)
+        summary = (rc.get("report") or {}).get("ai_feed_summary", "") or rc.get("ai_feed_summary", "")
+        slug = _safe_slug(title)
+        fname = f"{slug}.md"
+        lines.append(f"### [{title}]({link})\n\n")
+        lines.append(f"> **{venue}** | {date}\n\n")
+        if summary:
+            lines.append(f"{summary}\n\n")
+        lines.append(f"[📖 Full Report](./{fname})\n\n---\n\n")
+
+    if also_notable:
+        lines.append("## Also Notable\n\n")
+        by_venue: dict[str, list[dict]] = {}
+        for c in also_notable:
+            v = c.get("venue", "Other")
+            by_venue.setdefault(v, []).append(c)
+        for venue_name, cards in sorted(by_venue.items()):
+            lines.append(f"### {venue_name}\n\n")
+            for c in cards:
+                t = c.get("title", "")
+                lnk = c.get("link", "") or _best_link(c)
+                summary_short = (c.get("ai_feed_summary") or c.get("value_assessment") or "")[:120]
+                bullet = f"- [{t}]({lnk})" if lnk else f"- {t}"
+                if summary_short:
+                    bullet += f" — {summary_short}"
+                lines.append(bullet + "\n")
+            lines.append("\n")
+
+    (day_dir / "digest.md").write_text("".join(lines), encoding="utf-8")
+
+
 def _save_reports(
     date_str: str,
     report_cards: list[dict[str, Any]],
@@ -1728,54 +1828,12 @@ def _save_reports(
             local_pdf_path=str(local_pdf_file) if local_pdf_file.exists() else "",
         )
         md = _externalize_data_uri_images(md, date_str=date_str, day_dir=day_dir, slug=slug, log_cb=log_cb)
+        md = _localize_external_images(md, date_str=date_str, day_dir=day_dir, slug=slug, log_cb=log_cb)
         fpath = day_dir / f"{slug}.md"
         fpath.write_text(md, encoding="utf-8")
         paper_files.append((rc, fpath))
 
-    # Group also_notable by venue
-    by_venue: dict[str, list[dict]] = {}
-    for c in also_notable:
-        v = c.get("venue", "Other")
-        by_venue.setdefault(v, []).append(c)
-
-    # Write digest.md (English)
-    lines: list[str] = [
-        f"# 📚 Research Digest | {date_str}\n\n",
-        f"**{len(report_cards) + len(also_notable)}** papers fetched · "
-        f"**{len(report_cards)}** deep reads · "
-        f"**{len(also_notable)}** also notable\n\n",
-        "---\n\n",
-        "## Deep Reads\n\n",
-    ]
-    for rc, fpath in paper_files:
-        title = rc.get("title", "")
-        venue = rc.get("venue", "")
-        date = rc.get("date", "")
-        link = rc.get("link", "")
-        summary = (rc.get("report") or {}).get("ai_feed_summary", "") or rc.get("ai_feed_summary", "")
-        slug = fpath.stem
-        lines.append(f"### [{title}]({link})\n\n")
-        lines.append(f"> **{venue}** | {date}\n\n")
-        if summary:
-            lines.append(f"{summary}\n\n")
-        lines.append(f"[📖 Full Report](./{fpath.name})\n\n---\n\n")
-
-    if also_notable:
-        lines.append("## Also Notable\n\n")
-        for venue_name, cards in sorted(by_venue.items()):
-            lines.append(f"### {venue_name}\n\n")
-            for c in cards:
-                t = c.get("title", "")
-                lnk = c.get("link", "")
-                summary_short = (c.get("ai_feed_summary") or c.get("value_assessment") or "")[:120]
-                bullet = f"- [{t}]({lnk})" if lnk else f"- {t}"
-                if summary_short:
-                    bullet += f" — {summary_short}"
-                lines.append(bullet + "\n")
-            lines.append("\n")
-
-    digest_path = day_dir / "digest.md"
-    digest_path.write_text("".join(lines), encoding="utf-8")
+    _write_digest_md(date_str, report_cards, also_notable, day_dir)
 
     return day_dir
 
@@ -1928,17 +1986,6 @@ def _generate_note(
                 links.append(f"- [{st}]({sl}) *(sim {sc:.0%})*" if sl else f"- {st} *(sim {sc:.0%})*")
         related = "\n## 🔗 Related Papers\n\n" + "\n".join(links) + "\n"
 
-    frontmatter = (
-        "---\n"
-        f'title: "{title.replace(chr(34), chr(39))}"\n'
-        f'venue: "{venue}"\n'
-        f'date: "{date}"\n'
-        f'link: "{link}"\n'
-        f'paper_id: "{paper_id}"\n'
-        "type: paper-note\n"
-        "---\n\n"
-    )
-
     reading_space = (
         "\n---\n\n"
         "## 📝 Reading Notes\n\n"
@@ -1947,8 +1994,7 @@ def _generate_note(
     )
 
     return (
-        frontmatter
-        + f"# {title}\n\n"
+        f"# {title}\n\n"
         + meta_table
         + "\n"
         + note_body
@@ -2481,13 +2527,15 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
             local_pdf_path=str(local_pdf_file) if local_pdf_file.exists() else "",
         )
         md = _externalize_data_uri_images(md, date_str=date_str, day_dir=day_dir, slug=slug)
+        md = _localize_external_images(md, date_str=date_str, day_dir=day_dir, slug=slug)
         fpath = day_dir / f"{slug}.md"
         fpath.write_text(md, encoding="utf-8")
         md_path = str(fpath)
     except Exception:
         pass
 
-    # Promote paper from also_notable to report_cards in the stored run
+    # Promote paper from also_notable to report_cards in the stored run,
+    # then regenerate digest.md to reflect the updated counts.
     import sqlite3
     try:
         with sqlite3.connect(archive_db) as conn:
@@ -2513,6 +2561,14 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
                     (json.dumps(data, ensure_ascii=False), date_str),
                 )
                 conn.commit()
+
+                # Regenerate digest.md with updated lists
+                try:
+                    day_dir_digest = REPORTS_DIR / date_str
+                    day_dir_digest.mkdir(parents=True, exist_ok=True)
+                    _write_digest_md(date_str, report_cards, also_notable, day_dir_digest)
+                except Exception:
+                    pass
     except Exception:
         pass
 
