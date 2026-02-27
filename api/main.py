@@ -1269,59 +1269,9 @@ def _generate_deep_md(
             return False, "missing Pros/Cons subsections"
         return True, ""
 
-    # Pre-fetch figures so AI can embed them inline.
-    # Collect from multiple sources, then rank globally for method relevance.
+    # Disable auto figure extraction/insertion for report stability.
+    # Users can add figures manually in the report editor.
     figures_data: list[dict[str, str]] = []
-    figure_candidates: list[dict[str, str]] = []
-
-    def _append_figs(figs: list[dict[str, str]], source: str) -> None:
-        for f in figs:
-            u = str(f.get("url", "")).strip()
-            if not u:
-                continue
-            figure_candidates.append({
-                "url": u,
-                "caption": str(f.get("caption", "") or "").strip(),
-                "source": source,
-            })
-
-    if paper_id.startswith("arxiv:"):
-        _append_figs(_fetch_arxiv_figures(paper_id[6:], max_figs=12), "arxiv")
-    if link:
-        _append_figs(_fetch_page_figures(link, max_figs=6), "html")
-    if local_pdf_path:
-        _append_figs(_extract_pdf_figures_from_file(Path(local_pdf_path), max_figs=3), "pdf_local")
-    for pdf_url in _candidate_pdf_urls(card):
-        _append_figs(_fetch_pdf_figures(pdf_url, max_figs=2), "pdf_remote")
-    _append_figs(_extract_figures_from_text(full_text, max_figs=4), "text")
-
-    # Deduplicate by URL while preserving first occurrence.
-    seen_fig_urls: set[str] = set()
-    for f in figure_candidates:
-        u = f.get("url", "")
-        if not u or u in seen_fig_urls:
-            continue
-        seen_fig_urls.add(u)
-        figures_data.append(f)
-
-    # If we have semantic sources (arXiv/HTML/text), avoid generic PDF crops as primary candidates.
-    has_semantic_sources = any(
-        str(f.get("source", "")).lower() in {"arxiv", "html", "text"}
-        for f in figures_data
-    )
-    if has_semantic_sources:
-        filtered = [f for f in figures_data if not _is_generic_pdf_caption(f)]
-        if filtered:
-            figures_data = filtered
-    if figures_data:
-        method_context = " ".join([
-            title or "",
-            abstract or "",
-            str(report.get("methods_detailed", "") or ""),
-            (full_text or "")[:3000],
-        ])
-        figures_data = _rank_figures_for_method(figures_data, method_context)
-        figures_data = _ai_reorder_figures_for_method(figures_data)
 
     if api_key.strip():
         try:

@@ -58,6 +58,16 @@ body {
 .prose a { color: var(--accent); text-decoration: none; }
 .prose a:hover { text-decoration: underline; }
 .prose hr { border-color: #e5dfd4; margin: 1.15em 0; }
+/* Keep report math size consistent with body text */
+.prose .katex {
+  font-size: 1em !important;
+}
+.prose .katex-display {
+  font-size: 1em !important;
+  margin: 0.9em 0 !important;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
 
 button,
 input,
@@ -129,11 +139,11 @@ button:focus-visible {
   font-size: 0.9rem;
 }
 .note-prose .katex {
-  font-size: 1em;
+  font-size: 1em !important;
 }
 .note-prose .katex-display {
-  font-size: 1.05em;
-  margin: 0.95em 0;
+  font-size: 1em !important;
+  margin: 0.9em 0 !important;
   overflow-x: auto;
   overflow-y: hidden;
 }
