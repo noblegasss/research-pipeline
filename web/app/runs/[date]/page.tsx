@@ -4,6 +4,14 @@ import { api, loadLocalSettings, type RunData, type PaperCard as PaperCardData }
 import PaperCardComponent from "@/components/PaperCard";
 import { ExternalLink, FileText, Sparkles, Maximize2, Minimize2 } from "lucide-react";
 
+function safeSlug(text: string, maxLen = 60): string {
+  return text.toLowerCase()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/[\s_-]+/g, "_")
+    .replace(/^_|_$/g, "")
+    .slice(0, maxLen) || "paper";
+}
+
 // ── Also-notable row with "Summarize" button ──────────────────────────────
 function NotableRow({
   card,
@@ -19,6 +27,16 @@ function NotableRow({
   const [loading, setLoading] = useState(false);
   const [done, setDone] = useState(false);
   const [err, setErr] = useState("");
+  const notableText = (() => {
+    const ai = (card.ai_feed_summary || "").trim();
+    const value = (card.value_assessment || "").trim();
+    const abs = (card.source_abstract || "").replace(/\s+/g, " ").trim();
+    // If fallback summary is clipped, use a longer abstract preview for readability.
+    if (ai && ai.length < 220 && abs.length > ai.length + 80) {
+      return abs.length > 420 ? `${abs.slice(0, 420)}...` : abs;
+    }
+    return ai || value;
+  })();
 
   const handleSummarize = async () => {
     setLoading(true);
@@ -30,8 +48,8 @@ function NotableRow({
         setDone(true);
         onPromoted(res.card as PaperCardData);
       }
-    } catch (e: any) {
-      setErr(e.message || "Failed");
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "Failed");
     } finally {
       setLoading(false);
     }
@@ -47,9 +65,9 @@ function NotableRow({
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-[#2e2b27] leading-snug">{card.title}</p>
             <p className="text-xs text-[#8f887f] mt-0.5">{card.venue} · {card.date}</p>
-            {(card.ai_feed_summary || card.value_assessment) && (
+            {notableText && (
               <p className="text-xs text-[#565048] mt-1 leading-relaxed">
-                {card.ai_feed_summary || card.value_assessment}
+                {notableText}
               </p>
             )}
             {err && <p className="text-xs text-red-500 mt-1">{err}</p>}
@@ -92,17 +110,68 @@ export default function RunPage({ params }: { params: Promise<{ date: string }> 
   const [wide, setWide] = useState(true);
 
   useEffect(() => {
-    setLoading(true);
-    setError("");
-    setExtraCards([]);
-    api.getRun(date)
-      .then((r) => {
-        setRun(r);
+    queueMicrotask(() => {
+      setLoading(true);
+      setError("");
+      setExtraCards([]);
+    });
+    Promise.all([
+      api.getRun(date),
+      api.listReportAssets(date).catch(() => ({ files: [] as { name: string; size: number }[] })),
+    ])
+      .then(([r, assets]) => {
+        const pdfBySlug = new Map<string, string>();
+        for (const f of assets.files || []) {
+          const slug = f.name.replace(/\.pdf$/, "");
+          pdfBySlug.set(slug, `/api/reports/${date}/assets/${f.name}`);
+        }
+        const reportCards = (r.report_cards || []).map((c) => {
+          const slug = safeSlug(c.title || "");
+          return {
+            ...c,
+            downloaded_pdf_url: pdfBySlug.get(slug) || c.downloaded_pdf_url,
+          };
+        });
+        setRun({ ...r, report_cards: reportCards });
         setNotable(r.also_notable);
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [date]);
+
+  // Background: attempt to cache local PDFs for deep-read cards missing a local copy.
+  useEffect(() => {
+    const settings = loadLocalSettings();
+    if (!settings.download_pdf) return;
+    if (!run?.report_cards?.length) return;
+    const targets = run.report_cards.filter((c) => !c.downloaded_pdf_url && (c.link || c.paper_id));
+    if (!targets.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const c of targets) {
+        try {
+          const res = await api.cachePaperPdf(date, c);
+          if (cancelled) return;
+          if (res.ok && res.downloaded_pdf_url) {
+            setRun((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                report_cards: (prev.report_cards || []).map((x) =>
+                  x.paper_id === c.paper_id ? { ...x, downloaded_pdf_url: res.downloaded_pdf_url } : x
+                ),
+              };
+            });
+          }
+        } catch {
+          // best-effort only
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [date, run?.report_cards]);
 
   const handlePromoted = useCallback((card: PaperCardData) => {
     setExtraCards((prev) => [...prev, card]);

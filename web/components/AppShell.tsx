@@ -12,6 +12,22 @@ import {
 } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 
+function SectionHeader({
+  icon, label, open, onToggle,
+}: { icon: React.ReactNode; label: string; open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      className="w-full flex items-center gap-1.5 px-3 py-2 text-left rounded-lg mx-1 hover:bg-[#e8e4db]"
+      style={{ color: "#8f887e" }}
+    >
+      <span className="opacity-90">{icon}</span>
+      <span className="flex-1 text-[10px] font-semibold uppercase tracking-widest">{label}</span>
+      {open ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+    </button>
+  );
+}
+
 // ── Folder-aware notes section ─────────────────────────────────────────────
 
 function NotesFolderTree({
@@ -216,16 +232,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const clampedSidebarWidth = Math.max(220, Math.min(460, sidebarWidth));
 
   useEffect(() => {
-    setManualCollapse(null);
-  }, [onReportPage]);
-
-  useEffect(() => {
     if (typeof window === "undefined") return;
-    const saved = window.localStorage.getItem("app.sidebar.width");
-    const n = Number(saved);
-    if (Number.isFinite(n)) {
-      setSidebarWidth(Math.max(220, Math.min(460, n)));
-    }
+    queueMicrotask(() => {
+      const saved = Number(window.localStorage.getItem("app.sidebar.width"));
+      if (Number.isFinite(saved)) {
+        setSidebarWidth(Math.max(220, Math.min(460, saved)));
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -277,6 +290,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       });
       const data = await res.json();
       if (!data.started) {
+        if (data.reason === "beta_daily_limit") {
+          setRunLog([`⚠️ Beta daily limit reached: pipeline can run once per day (${data.date}).`]);
+          setRunning(false);
+          return;
+        }
         if (data.reason === "already_run_today") {
           setRunning(false);
           setRunLog([]);
@@ -291,8 +309,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         setRunLog(["⚠️ Pipeline is already running in the background."]);
         // Still start polling so UI reflects current state
       }
-    } catch (e: any) {
-      setRunLog([`❌ Failed to start: ${e.message}`]);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      setRunLog([`❌ Failed to start: ${msg}`]);
       setRunning(false);
       return;
     }
@@ -333,21 +352,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   const sidebarBg = "var(--sidebar-bg)";
   const sidebarBorder = "var(--sidebar-border)";
-
-  // Section header component
-  const SectionHeader = ({
-    icon, label, open, onToggle,
-  }: { icon: React.ReactNode; label: string; open: boolean; onToggle: () => void }) => (
-    <button
-      onClick={onToggle}
-      className="w-full flex items-center gap-1.5 px-3 py-2 text-left rounded-lg mx-1 hover:bg-[#e8e4db]"
-      style={{ color: "#8f887e" }}
-    >
-      <span className="opacity-90">{icon}</span>
-      <span className="flex-1 text-[10px] font-semibold uppercase tracking-widest">{label}</span>
-      {open ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
-    </button>
-  );
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -567,6 +571,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           {[
             { href: "/settings", icon: <Settings size={14} />, label: t("settings") },
             { href: "/network", icon: <Network size={14} />, label: t("paper_network") },
+            { href: "/search", icon: <Search size={14} />, label: t("report_search") },
           ].map(({ href, icon, label }) => (
             <button
               key={href}

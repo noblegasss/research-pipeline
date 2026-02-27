@@ -13,6 +13,10 @@ function colorFor(group: string, groups: string[]) {
   return PALETTE[idx % PALETTE.length];
 }
 
+function edgeNodeId(v: string | NetworkNode): string {
+  return typeof v === "string" ? v : v.id;
+}
+
 export default function NetworkPage() {
   const svgRef = useRef<SVGSVGElement>(null);
   const [data, setData] = useState<NetworkData | null>(null);
@@ -22,7 +26,6 @@ export default function NetworkPage() {
   const [limit, setLimit] = useState(150);
 
   useEffect(() => {
-    setLoading(true);
     api.getNetwork(limit, threshold)
       .then(setData)
       .finally(() => setLoading(false));
@@ -67,8 +70,8 @@ export default function NetworkPage() {
 
     // Node group
     const node = g.append("g").attr("class", "nodes")
-      .selectAll("g")
-      .data(data.nodes)
+      .selectAll<SVGGElement, NetworkNode>("g")
+      .data(data.nodes as NetworkNode[])
       .join("g")
       .attr("cursor", "pointer")
       .call(
@@ -86,7 +89,7 @@ export default function NetworkPage() {
             if (!event.active) simulation.alphaTarget(0);
             (d as d3.SimulationNodeDatum).fx = null;
             (d as d3.SimulationNodeDatum).fy = null;
-          }) as d3.DragBehavior<SVGGElement, unknown, unknown>
+          })
       );
 
     // Outer glow ring
@@ -118,11 +121,13 @@ export default function NetworkPage() {
         setHovered(d);
         link
           .attr("stroke-opacity", (e) =>
-            (e.source as NetworkNode).id === d.id || (e.target as NetworkNode).id === d.id
+            edgeNodeId(e.source as string | NetworkNode) === d.id
+            || edgeNodeId(e.target as string | NetworkNode) === d.id
               ? 0.9
               : 0.08)
           .attr("stroke", (e) =>
-            (e.source as NetworkNode).id === d.id || (e.target as NetworkNode).id === d.id
+            edgeNodeId(e.source as string | NetworkNode) === d.id
+            || edgeNodeId(e.target as string | NetworkNode) === d.id
               ? colorFor(d.group, groups)
               : "#94a3b8");
       })
@@ -158,14 +163,20 @@ export default function NetworkPage() {
         <div className="flex items-center gap-2 text-xs text-gray-500">
           <label>Papers:</label>
           <input type="range" min={20} max={300} step={10} value={limit}
-            onChange={(e) => setLimit(Number(e.target.value))}
+            onChange={(e) => {
+              setLoading(true);
+              setLimit(Number(e.target.value));
+            }}
             className="w-24" />
           <span className="w-8 text-center">{limit}</span>
         </div>
         <div className="flex items-center gap-2 text-xs text-gray-500">
           <label>Min similarity:</label>
           <input type="range" min={0.1} max={0.6} step={0.05} value={threshold}
-            onChange={(e) => setThreshold(Number(e.target.value))}
+            onChange={(e) => {
+              setLoading(true);
+              setThreshold(Number(e.target.value));
+            }}
             className="w-24" />
           <span className="w-8 text-center">{threshold.toFixed(2)}</span>
         </div>

@@ -4,7 +4,14 @@ import { api, loadLocalSettings, saveLocalSettings, type AppSettings } from "@/l
 import { Plus, X, Check, Loader2, Eye, EyeOff, KeyRound } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 
-const MODELS = ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "gpt-5"];
+const OPENAI_MODELS = ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "gpt-5"];
+const GEMINI_MODELS = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-1.5-flash",
+  "gemini-2.5-pro",
+  "gemini-3-pro-preview",
+];
 
 // ── TagList ────────────────────────────────────────────────────────────────
 function TagList({
@@ -129,7 +136,8 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [synced, setSynced] = useState(false);
-  const [showKey, setShowKey] = useState(false);
+  const [showOpenAIKey, setShowOpenAIKey] = useState(false);
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
   // Track whether the initial load is done so we don't auto-save before reading
   const initializedRef = useRef(false);
@@ -180,11 +188,22 @@ export default function SettingsPage() {
     window.dispatchEvent(new Event("app-language-change"));
   }, [settings]);
 
+  useEffect(() => {
+    if (!settings) return;
+    setSettings((prev) => {
+      if (!prev) return prev;
+      const options = prev.api_provider === "gemini" ? GEMINI_MODELS : OPENAI_MODELS;
+      if (options.includes(prev.api_model)) return prev;
+      return { ...prev, api_model: options[0] };
+    });
+  }, [settings]);
+
   if (!settings) return (
     <div className="flex items-center justify-center h-64 text-gray-400 text-sm">{t("loading")}</div>
   );
 
   const allJournals = [...settings.journals, ...settings.custom_journals];
+  const modelOptions = settings.api_provider === "gemini" ? GEMINI_MODELS : OPENAI_MODELS;
 
   return (
     <div className="max-w-2xl mx-auto px-8 py-8">
@@ -225,36 +244,79 @@ export default function SettingsPage() {
           </div>
         </Section>
 
-        {/* ── OpenAI API Key (highlighted, top) ── */}
-        <Section title="🔑 OpenAI API Key" highlight>
+        {/* ── AI Provider & API Keys ── */}
+        <Section title="🤖 AI Provider" highlight>
           <p className="text-xs text-gray-500 mb-3">
-            Required for AI summaries and paper scoring. Stored only in your browser.
+            Choose provider first, then fill the corresponding API key.
+          </p>
+          <div className="flex gap-2 mb-4">
+            {(["gemini", "openai"] as const).map((provider) => (
+              <button
+                key={provider}
+                onClick={() => patch("api_provider", provider)}
+                className={`text-sm px-4 py-2 rounded-lg border transition-colors ${
+                  settings.api_provider === provider
+                    ? "bg-blue-600 text-white border-blue-600"
+                    : "bg-white text-gray-600 border-gray-200 hover:border-blue-400"
+                }`}
+              >
+                {provider === "gemini" ? "Gemini" : "OpenAI"}
+              </button>
+            ))}
+          </div>
+
+          <label className="text-xs font-medium text-gray-600 block mb-1.5">Gemini API Key</label>
+          <div className="relative mb-2">
+            <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+            <input
+              type={showGeminiKey ? "text" : "password"}
+              value={settings.gemini_api_key}
+              onChange={(e) => patch("gemini_api_key", e.target.value)}
+              placeholder="AIza…"
+              className="w-full text-sm border rounded-lg pl-9 pr-10 py-2.5 outline-none focus:border-blue-400 transition-colors font-mono bg-white"
+            />
+            <button
+              onClick={() => setShowGeminiKey((v) => !v)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
+            >
+              {showGeminiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+            </button>
+          </div>
+          {settings.gemini_api_key && (
+            <p className="text-xs text-green-600 mb-3 flex items-center gap-1">
+              <Check size={11} /> Gemini key set
+            </p>
+          )}
+
+          <label className="text-xs font-medium text-gray-600 block mb-1.5">OpenAI API Key</label>
+          <p className="text-xs text-gray-500 mb-3">
+            Stored only in your browser unless you click sync.
           </p>
           <div className="relative">
             <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
-              type={showKey ? "text" : "password"}
+              type={showOpenAIKey ? "text" : "password"}
               value={settings.openai_api_key}
               onChange={(e) => patch("openai_api_key", e.target.value)}
               placeholder="sk-proj-…"
               className="w-full text-sm border rounded-lg pl-9 pr-10 py-2.5 outline-none focus:border-blue-400 transition-colors font-mono bg-white"
             />
             <button
-              onClick={() => setShowKey((v) => !v)}
+              onClick={() => setShowOpenAIKey((v) => !v)}
               className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
             >
-              {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
+              {showOpenAIKey ? <EyeOff size={15} /> : <Eye size={15} />}
             </button>
           </div>
           {settings.openai_api_key && (
             <p className="text-xs text-green-600 mt-1.5 flex items-center gap-1">
-              <Check size={11} /> API key set
+              <Check size={11} /> OpenAI key set
             </p>
           )}
           <div className="mt-3">
             <label className="text-xs font-medium text-gray-600 block mb-1.5">Model</label>
             <div className="flex gap-2 flex-wrap">
-              {MODELS.map((m) => (
+              {modelOptions.map((m) => (
                 <button key={m} onClick={() => patch("api_model", m)}
                   className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
                     settings.api_model === m
@@ -311,8 +373,8 @@ export default function SettingsPage() {
             </div>
             <div>
               <label className="text-xs font-medium text-gray-600 block mb-1.5">Max deep-read reports</label>
-              <input type="number" min={1} max={10} value={settings.max_reports}
-                onChange={(e) => patch("max_reports", Number(e.target.value))}
+              <input type="number" min={1} max={5} value={settings.max_reports}
+                onChange={(e) => patch("max_reports", Math.max(1, Math.min(5, Number(e.target.value) || 1)))}
                 className="w-full text-sm border rounded-lg px-3 py-2 outline-none focus:border-blue-400" />
             </div>
             <div className="col-span-2">
@@ -328,6 +390,14 @@ export default function SettingsPage() {
                 className="rounded" />
               <label htmlFor="strict" className="text-sm text-gray-700 cursor-pointer select-none">
                 Strict journal matching
+              </label>
+            </div>
+            <div className="col-span-2 flex items-center gap-2">
+              <input type="checkbox" id="download_pdf" checked={settings.download_pdf}
+                onChange={(e) => patch("download_pdf", e.target.checked)}
+                className="rounded" />
+              <label htmlFor="download_pdf" className="text-sm text-gray-700 cursor-pointer select-none">
+                Auto-download PDF for deep reports (default: on)
               </label>
             </div>
           </div>

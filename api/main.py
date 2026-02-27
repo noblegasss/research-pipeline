@@ -7,15 +7,19 @@ import os
 import re
 import sys
 import asyncio
+import base64
+import hashlib
+import io
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import threading
 import time
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 # ── Python path ────────────────────────────────────────────────────────────
@@ -101,6 +105,193 @@ def _load_config() -> dict[str, Any]:
 
 def _save_config(cfg: dict[str, Any]) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+
+
+def _app_mode() -> str:
+    cfg = _load_config()
+    mode = str(cfg.get("app_mode", os.getenv("APP_MODE", "normal"))).strip().lower()
+    return mode or "normal"
+
+
+def _is_beta_mode() -> bool:
+    return _app_mode() == "beta"
+
+
+def _normalize_timezone(tz: str | None) -> str:
+    candidate = str(tz or "").strip() or str(os.getenv("APP_TIMEZONE", "UTC")).strip() or "UTC"
+    try:
+        ZoneInfo(candidate)
+        return candidate
+    except Exception:
+        return "UTC"
+
+
+def _default_timezone() -> str:
+    cfg = _load_config()
+    return _normalize_timezone(cfg.get("timezone", os.getenv("APP_TIMEZONE", "UTC")))
+
+
+def _today_in_tz(tz: str | None = None) -> str:
+    tz_name = _normalize_timezone(tz or _default_timezone())
+    return datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+
+
+def _beta_note_daily_limit() -> int:
+    try:
+        return max(1, int(os.getenv("BETA_DAILY_NOTE_LIMIT", "1")))
+    except Exception:
+        return 1
+
+
+def _beta_forced_model() -> str:
+    # Keep beta costs predictable; can be overridden by env if needed.
+    return str(os.getenv("BETA_FORCED_MODEL", "gpt-4.1-mini")).strip() or "gpt-4.1-mini"
+
+
+def _normalize_api_provider(provider: str | None) -> str:
+    p = str(provider or "").strip().lower()
+    return p if p in {"openai", "gemini"} else "gemini"
+
+
+def _default_model_for_provider(provider: str | None) -> str:
+    p = _normalize_api_provider(provider)
+    return "gemini-2.5-flash-lite" if p == "gemini" else "gpt-4.1-mini"
+
+
+def _clamp_max_reports(v: Any) -> int:
+    try:
+        n = int(v)
+    except Exception:
+        n = 5
+    return max(1, min(5, n))
+
+
+def _effective_model(requested: str | None, provider: str | None = None) -> str:
+    if _is_beta_mode():
+        return _beta_forced_model()
+    m = str(requested or "").strip()
+    return m or _default_model_for_provider(provider)
+
+
+def _resolve_api_key(provider: str, settings_key: str, cfg_key: str, env_keys: list[str]) -> str:
+    if settings_key.strip():
+        return settings_key.strip()
+    cfg = _load_config()
+    cfg_value = str(cfg.get(cfg_key, "") or "").strip()
+    if cfg_value:
+        return cfg_value
+    for ek in env_keys:
+        v = str(os.getenv(ek, "") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _resolve_provider_and_key(
+    provider: str | None,
+    openai_api_key: str | None,
+    gemini_api_key: str | None,
+) -> tuple[str, str]:
+    p = _normalize_api_provider(provider)
+    if p == "gemini":
+        key = _resolve_api_key(
+            provider=p,
+            settings_key=str(gemini_api_key or ""),
+            cfg_key="gemini_api_key",
+            env_keys=["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        )
+        return p, key
+    key = _resolve_api_key(
+        provider=p,
+        settings_key=str(openai_api_key or ""),
+        cfg_key="openai_api_key",
+        env_keys=["OPENAI_API_KEY"],
+    )
+    return p, key
+
+
+def _make_openai_compatible_client(provider: str, api_key: str):
+    from openai import OpenAI
+    if _normalize_api_provider(provider) == "gemini":
+        base_url = str(
+            os.getenv("GEMINI_OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+        ).strip()
+        return OpenAI(api_key=api_key.strip(), base_url=base_url)
+    return OpenAI(api_key=api_key.strip())
+
+
+def _create_text_completion(
+    client: Any,
+    provider: str,
+    model: str,
+    system_prompt: str,
+    user_content: str,
+    max_output_tokens: int,
+    timeout: int | None = None,
+) -> str:
+    p = _normalize_api_provider(provider)
+    if p == "gemini":
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "max_tokens": max_output_tokens,
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = client.chat.completions.create(**kwargs)
+        choice = (getattr(resp, "choices", None) or [None])[0]
+        msg = getattr(choice, "message", None)
+        content = getattr(msg, "content", "") if msg else ""
+        return (content or "").strip()
+
+    kwargs = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_output_tokens": max_output_tokens,
+    }
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    resp = client.responses.create(**kwargs)
+    return (getattr(resp, "output_text", "") or "").strip()
+
+
+def _check_beta_note_limit_or_raise(tz: str | None = None) -> None:
+    if not _is_beta_mode():
+        return
+    today = _today_in_tz(tz)
+    cfg = _load_config()
+    usage = cfg.get("beta_note_daily_usage", {})
+    if not isinstance(usage, dict):
+        usage = {}
+    used = int(usage.get(today, 0) or 0)
+    limit = _beta_note_daily_limit()
+    if used >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Beta limit reached: generate note is limited to {limit} per day ({_normalize_timezone(tz)}).",
+        )
+
+
+def _mark_beta_note_usage(tz: str | None = None) -> None:
+    if not _is_beta_mode():
+        return
+    today = _today_in_tz(tz)
+    cfg = _load_config()
+    usage = cfg.get("beta_note_daily_usage", {})
+    if not isinstance(usage, dict):
+        usage = {}
+    usage[today] = int(usage.get(today, 0) or 0) + 1
+    # keep recent history only
+    keys = sorted(usage.keys(), reverse=True)
+    usage = {k: usage[k] for k in keys[:14]}
+    cfg["beta_note_daily_usage"] = usage
+    _save_config(cfg)
 
 
 def _best_link(card: dict[str, Any]) -> str:
@@ -230,6 +421,57 @@ def _fetch_page_figures(page_url: str, max_figs: int = 4) -> list[dict[str, str]
             if len(out) >= max_figs:
                 return out
 
+        # Fallback: scan generic <img> tags (useful for publishers that do not wrap with <figure>)
+        def _is_noise_image(src: str, alt: str) -> bool:
+            s = (src or "").lower()
+            a = (alt or "").lower()
+            noise_keys = (
+                "logo", "icon", "sprite", "avatar", "badge", "banner",
+                "social", "share", "tracking", "pixel", "favicon", "nav",
+            )
+            if any(k in s for k in noise_keys):
+                return True
+            if any(k in a for k in ("logo", "icon", "navigation", "menu")):
+                return True
+            return False
+
+        for m in re.finditer(r'(?is)<img\b([^>]+)>', html):
+            tag = m.group(1)
+            src_m = re.search(r'(?is)\bsrc=["\']([^"\']+)["\']', tag)
+            if not src_m:
+                continue
+            src = src_m.group(1).strip()
+            if not src or src.startswith("data:"):
+                continue
+            if src.startswith("//"):
+                src = f"https:{src}"
+            elif not src.startswith("http"):
+                src = urljoin(final_url, src)
+
+            alt_m = re.search(r'(?is)\balt=["\']([^"\']*)["\']', tag)
+            alt = (alt_m.group(1).strip() if alt_m else "")
+            if _is_noise_image(src, alt):
+                continue
+            if src in seen:
+                continue
+            seen.add(src)
+
+            cap = alt or "Figure"
+            # Prefer likely scientific figures first
+            priority = 0
+            s_l = src.lower()
+            if re.search(r"(?:/|_|-)(fig(?:ure)?|image|media)(?:/|_|-|\d)", s_l):
+                priority += 2
+            if re.search(r"\.(png|jpe?g|webp)(?:[\?#].*)?$", s_l):
+                priority += 1
+
+            out.append({"url": src, "caption": cap[:180], "_priority": str(priority)})
+
+        if out:
+            out.sort(key=lambda x: int(x.get("_priority", "0")), reverse=True)
+            cleaned = [{"url": x["url"], "caption": x.get("caption", "")} for x in out[:max_figs]]
+            return cleaned
+
         # Fallback: og/twitter image
         for patt in (
             r'(?is)<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -249,14 +491,471 @@ def _fetch_page_figures(page_url: str, max_figs: int = 4) -> list[dict[str, str]
         return []
 
 
+def _candidate_pdf_urls(card: dict[str, Any]) -> list[str]:
+    link = (card.get("link") or "").strip()
+    pid = (card.get("paper_id") or "").strip()
+    out: list[str] = []
+    if not link and not pid:
+        return out
+
+    if link.lower().endswith(".pdf"):
+        out.append(link)
+    if pid.startswith("arxiv:"):
+        out.append(f"https://arxiv.org/pdf/{pid[6:]}.pdf")
+
+    # bioRxiv / medRxiv: links may include query params like ?rss=1
+    if link and (re.search(r"biorxiv\.org/content/", link) or re.search(r"medrxiv\.org/content/", link)):
+        base = link.split("?", 1)[0].rstrip("/")
+        out.append(base + ".full.pdf")
+        out.append(base + ".full.pdf?download=true")
+        out.append(base + ".full.pdf?download=1")
+        # fallback to raw with query stripped normalization
+        out.append(link.rstrip("/") + ".full.pdf")
+
+    # de-duplicate while preserving order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for u in out:
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def _discover_pdf_urls_from_landing(page_url: str) -> list[str]:
+    """Parse landing HTML for explicit PDF links (e.g., citation_pdf_url)."""
+    if not page_url:
+        return []
+    try:
+        import requests
+        import certifi
+        from requests.exceptions import SSLError as _ReqSSLError
+        from urllib.parse import urljoin
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        try:
+            resp = requests.get(page_url, headers=headers, timeout=15, allow_redirects=True, verify=certifi.where())
+        except _ReqSSLError:
+            resp = requests.get(page_url, headers=headers, timeout=15, allow_redirects=True, verify=False)
+        if resp.status_code >= 400:
+            return []
+        html = resp.text or ""
+        final_url = resp.url or page_url
+        found: list[str] = []
+
+        # <meta name="citation_pdf_url" content="...">
+        for m in re.finditer(r'(?is)<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']', html):
+            u = m.group(1).strip()
+            if u:
+                found.append(u if u.startswith("http") else urljoin(final_url, u))
+
+        # Any direct href ending with .pdf
+        for m in re.finditer(r'(?is)<a[^>]+href=["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']', html):
+            u = m.group(1).strip()
+            if u:
+                found.append(u if u.startswith("http") else urljoin(final_url, u))
+
+        # Deduplicate preserving order
+        seen: set[str] = set()
+        out: list[str] = []
+        for u in found:
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+    except Exception:
+        return []
+
+
+def _fetch_pdf_figures(pdf_url: str, max_figs: int = 2) -> list[dict[str, str]]:
+    """Best-effort extraction of embedded images from PDF to data-URI figures."""
+    if not pdf_url:
+        return []
+    try:
+        import urllib.request as _ur
+
+        req = _ur.Request(pdf_url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+        with _ur.urlopen(req, timeout=8) as resp:
+            pdf_bytes = resp.read()
+    except Exception:
+        return []
+
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return []
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    max_pages = min(8, len(reader.pages))
+
+    for page_idx in range(max_pages):
+        page = reader.pages[page_idx]
+        images = getattr(page, "images", None) or []
+        for img in images:
+            data = getattr(img, "data", b"") or b""
+            name = str(getattr(img, "name", "") or "").lower()
+            if not data:
+                continue
+            # Skip likely icons/sprites and overly large payloads for markdown
+            if len(data) < 8_000 or len(data) > 900_000:
+                continue
+            if any(k in name for k in ("logo", "icon", "sprite", "favicon")):
+                continue
+
+            mime = "image/png"
+            if name.endswith(".jpg") or name.endswith(".jpeg"):
+                mime = "image/jpeg"
+            elif name.endswith(".webp"):
+                mime = "image/webp"
+
+            b64 = base64.b64encode(data).decode("ascii")
+            data_url = f"data:{mime};base64,{b64}"
+            sig = data_url[:120]
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append({
+                "url": data_url,
+                "caption": f"PDF Figure {len(out)+1} (page {page_idx+1})",
+            })
+            if len(out) >= max_figs:
+                return out
+    return out
+
+
+def _extract_pdf_figures_from_bytes(pdf_bytes: bytes, max_figs: int = 2) -> list[dict[str, str]]:
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return []
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    max_pages = min(8, len(reader.pages))
+
+    for page_idx in range(max_pages):
+        page = reader.pages[page_idx]
+        images = getattr(page, "images", None) or []
+        for img in images:
+            data = getattr(img, "data", b"") or b""
+            name = str(getattr(img, "name", "") or "").lower()
+            if not data:
+                continue
+            if len(data) < 8_000 or len(data) > 900_000:
+                continue
+            if any(k in name for k in ("logo", "icon", "sprite", "favicon")):
+                continue
+
+            mime = "image/png"
+            if name.endswith(".jpg") or name.endswith(".jpeg"):
+                mime = "image/jpeg"
+            elif name.endswith(".webp"):
+                mime = "image/webp"
+
+            b64 = base64.b64encode(data).decode("ascii")
+            data_url = f"data:{mime};base64,{b64}"
+            sig = data_url[:120]
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append({
+                "url": data_url,
+                "caption": f"PDF Figure {len(out)+1} (page {page_idx+1})",
+            })
+            if len(out) >= max_figs:
+                return out
+    return out
+
+
+def _extract_pdf_figures_from_file(pdf_file: Path, max_figs: int = 2) -> list[dict[str, str]]:
+    try:
+        if not pdf_file.exists():
+            return []
+        data = pdf_file.read_bytes()
+        if not data.startswith(b"%PDF"):
+            return []
+        return _extract_pdf_figures_from_bytes(data, max_figs=max_figs)
+    except Exception:
+        return []
+
+
+def _download_pdf_copy(pdf_url: str, dest_file: Path) -> tuple[bool, str]:
+    """Download a PDF to local disk for report traceability."""
+    if not pdf_url:
+        return False, "empty url"
+    try:
+        import requests
+        import certifi
+        from requests.exceptions import SSLError as _ReqSSLError
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible)",
+            "Accept": "application/pdf,*/*;q=0.8",
+            "Referer": "https://www.biorxiv.org/",
+        }
+
+        try:
+            resp = requests.get(
+                pdf_url,
+                headers=headers,
+                timeout=20,
+                allow_redirects=True,
+                verify=certifi.where(),
+            )
+        except _ReqSSLError:
+            # Fallback for local cert-store issues on some machines.
+            resp = requests.get(
+                pdf_url,
+                headers=headers,
+                timeout=20,
+                allow_redirects=True,
+                verify=False,
+            )
+        if resp.status_code >= 400:
+            return False, f"http {resp.status_code}"
+        data = resp.content or b""
+        if not data or len(data) < 1_024:
+            return False, "payload too small"
+        # Minimal PDF signature check (allow small preamble before %PDF)
+        head = data[:2048]
+        pos = head.find(b"%PDF")
+        if pos < 0:
+            ctype = (resp.headers.get("content-type") or "").lower()
+            return False, f"not a pdf payload (content-type={ctype or 'unknown'})"
+        if pos > 0:
+            data = data[pos:]
+        dest_file.write_bytes(data)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _maybe_download_pdf_for_report(
+    card: dict[str, Any],
+    day_dir: Path,
+    slug: str,
+    log_cb: Any | None = None,
+) -> tuple[str, str]:
+    """Return (local_api_url, source_pdf_url) when local PDF copy exists."""
+    candidates = _candidate_pdf_urls(card)
+    link = (card.get("link") or "").strip()
+    if link:
+        candidates.extend(_discover_pdf_urls_from_landing(link))
+        # de-dup again
+        seen2: set[str] = set()
+        uniq2: list[str] = []
+        for u in candidates:
+            if u and u not in seen2:
+                seen2.add(u)
+                uniq2.append(u)
+        candidates = uniq2
+    if not candidates:
+        return "", ""
+    pdf_src = candidates[0]
+    assets_dir = day_dir / "assets"
+    local_name = f"{slug}.pdf"
+    local_file = assets_dir / local_name
+    if not local_file.exists():
+        ok = False
+        for c in candidates:
+            ok_c, reason = _download_pdf_copy(c, local_file)
+            if ok_c:
+                pdf_src = c
+                ok = True
+                break
+            if callable(log_cb):
+                short = reason[:180] if reason else "unknown"
+                log_cb(f"⚠️ PDF download failed for {slug}: {short}")
+        if not ok:
+            return "", pdf_src
+    return f"/api/reports/{day_dir.name}/assets/{local_name}", pdf_src
+
+
+def _try_download_pdf_for_report(
+    card: dict[str, Any],
+    day_dir: Path,
+    slug: str,
+) -> tuple[bool, str, str]:
+    """Return (ok, local_url, detail). detail is either chosen source URL or failure reason."""
+    candidates = _candidate_pdf_urls(card)
+    link = (card.get("link") or "").strip()
+    if link:
+        candidates.extend(_discover_pdf_urls_from_landing(link))
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for u in candidates:
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    if not uniq:
+        return False, "", "no candidate pdf url"
+
+    assets_dir = day_dir / "assets"
+    local_name = f"{slug}.pdf"
+    local_file = assets_dir / local_name
+    if local_file.exists():
+        return True, f"/api/reports/{day_dir.name}/assets/{local_name}", "already cached"
+
+    last_reason = "unknown"
+    for u in uniq:
+        ok, reason = _download_pdf_copy(u, local_file)
+        if ok:
+            return True, f"/api/reports/{day_dir.name}/assets/{local_name}", u
+        last_reason = f"{u} -> {reason}"
+    return False, "", last_reason
+
+
+def _local_pdf_file_for_report(day_dir: Path, slug: str) -> Path:
+    return day_dir / "assets" / f"{slug}.pdf"
+
+
+def _extract_figures_from_text(text: str, max_figs: int = 4) -> list[dict[str, str]]:
+    """Extract image URLs from already-fetched paper text (markdown/html snippets)."""
+    if not text:
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _looks_like_figure_url(u: str) -> bool:
+        if re.search(r"\.(png|jpe?g|webp|gif|svg)(?:[\?#].*)?$", u, re.IGNORECASE):
+            return True
+        # Many publisher figure URLs do not end with an image extension.
+        return bool(re.search(r"(?:/|_|-)(fig(?:ure)?|image|media)(?:/|_|-|\d)", u, re.IGNORECASE))
+
+    def _push(url: str, caption: str = "") -> None:
+        if len(out) >= max_figs:
+            return
+        u = (url or "").strip()
+        if not u or u in seen:
+            return
+        if not _looks_like_figure_url(u):
+            return
+        seen.add(u)
+        out.append({"url": u, "caption": (caption or "").strip()[:180]})
+
+    # Markdown images: ![caption](url)
+    for m in re.finditer(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)", text, flags=re.IGNORECASE):
+        _push(m.group(2), m.group(1))
+        if len(out) >= max_figs:
+            return out
+
+    # HTML images: <img src="...">
+    for m in re.finditer(r'(?is)<img[^>]+src=["\'](https?://[^"\']+)["\']', text):
+        _push(m.group(1), "Figure")
+        if len(out) >= max_figs:
+            return out
+
+    # Raw direct image URLs in text
+    for m in re.finditer(r"https?://[^\s)\"']+\.(?:png|jpe?g|webp|gif|svg)(?:\?[^\s)\"']*)?", text, flags=re.IGNORECASE):
+        _push(m.group(0), "Figure")
+        if len(out) >= max_figs:
+            return out
+
+    return out
+
+
+def _score_reason_is_generic(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    generic_prefixes = (
+        "estimated from",
+        "combined from",
+        "based on keyword",
+        "derived from",
+    )
+    return any(t.startswith(p) for p in generic_prefixes)
+
+
+def _generate_ai_score_reasons(
+    *,
+    api_provider: str,
+    api_key: str,
+    model: str,
+    title: str,
+    venue: str,
+    date: str,
+    abstract: str,
+    report: dict[str, Any],
+    full_text: str,
+    scores: dict[str, Any],
+) -> dict[str, str]:
+    if not api_key.strip():
+        return {}
+    try:
+        client = _make_openai_compatible_client(api_provider, api_key)
+        sys_prompt = (
+            "You are a strict scientific reviewer. Explain 4 paper scores with concrete evidence.\n"
+            "Return ONLY JSON with keys: relevance, novelty, rigor, impact.\n"
+            "Each value should be 1-2 concise sentences (roughly 20-45 words), specific and non-generic.\n"
+            "Use only available evidence; if uncertain, explicitly say uncertainty."
+        )
+        payload = {
+            "title": title,
+            "venue": venue,
+            "date": date,
+            "scores": {
+                "relevance": scores.get("relevance"),
+                "novelty": scores.get("novelty"),
+                "rigor": scores.get("rigor"),
+                "impact": scores.get("impact"),
+            },
+            "abstract": abstract,
+            "report_summary": report.get("ai_feed_summary", ""),
+            "methods": report.get("methods_detailed", ""),
+            "conclusion": report.get("main_conclusion", ""),
+            "future_direction": report.get("future_direction", ""),
+            "paper_text_excerpt": (full_text or "")[:8000],
+        }
+        raw = _create_text_completion(
+            client=client,
+            provider=api_provider,
+            model=model or _default_model_for_provider(api_provider),
+            system_prompt=sys_prompt,
+            user_content=json.dumps(payload, ensure_ascii=False),
+            max_output_tokens=900,
+            timeout=20,
+        )
+        s = raw.strip()
+        if "{" in s and "}" in s:
+            s = s[s.find("{"): s.rfind("}") + 1]
+        obj = json.loads(s)
+        out: dict[str, str] = {}
+        for k in ("relevance", "novelty", "rigor", "impact"):
+            v = str(obj.get(k, "")).strip()
+            if v:
+                out[k] = re.sub(r"\s+", " ", v)
+        return out
+    except Exception:
+        return {}
+
+
 # ── Deep Markdown generation ───────────────────────────────────────────────
 
 def _generate_deep_md(
     card: dict[str, Any],
     report: dict[str, Any],
     similar: list[dict[str, Any]],
+    api_provider: str,
     api_key: str,
     model: str,
+    downloaded_pdf_url: str = "",
+    source_pdf_url: str = "",
+    local_pdf_path: str = "",
 ) -> str:
     """Generate a rich long-form Markdown literature review for one paper."""
     title = card.get("title", "Untitled")
@@ -266,7 +965,8 @@ def _generate_deep_md(
     link = card.get("link", "") or _best_link(card)
     paper_id = card.get("paper_id", "")
     scores = card.get("scores") or {}
-    full_text = (card.get("source_content", "") or "")[:40000]
+    full_text_cap = 16000 if _normalize_api_provider(api_provider) == "gemini" else 40000
+    full_text = (card.get("source_content", "") or "")[:full_text_cap]
 
     md_body = ""
     ai_error = ""
@@ -303,6 +1003,216 @@ def _generate_deep_md(
         text = re.sub(r"\\\[(.+?)\\\]", r"$$\1$$", text, flags=re.DOTALL)
         return text
 
+    def _prompt_safe_figure_url(url: str) -> str:
+        s = (url or "").strip()
+        if s.startswith("data:image/"):
+            # Do not inject huge base64 payloads into LLM prompts.
+            return f"[embedded-data-image omitted; length={len(s)}]"
+        return s
+
+    def _repair_image_links(markdown_text: str, figs: list[dict[str, str]]) -> str:
+        """Replace placeholder/invalid image URLs (e.g., '(url)') with real figure URLs."""
+        if not markdown_text or "![" not in markdown_text or not figs:
+            return markdown_text
+
+        figure_urls = [str(f.get("url", "")).strip() for f in figs if str(f.get("url", "")).strip()]
+        if not figure_urls:
+            return markdown_text
+
+        def _is_valid_image_link(u: str) -> bool:
+            s = (u or "").strip()
+            if not s:
+                return False
+            if s.startswith("http://") or s.startswith("https://") or s.startswith("/api/") or s.startswith("data:image/"):
+                return True
+            return False
+
+        img_pat = re.compile(r"!\[([^\]]*)\]\(([^)]*)\)")
+
+        def _pick_url(alt_text: str, cur_url: str) -> str:
+            cur = (cur_url or "").strip()
+            if _is_valid_image_link(cur):
+                return cur
+            if cur.lower() in {"url", "<url>", "figure_url", "image_url", "link", "#"}:
+                pass
+            # If alt mentions "Figure N", try that index; else fallback to top-ranked figure.
+            m = re.search(r"(?:figure|fig)\s*(\d+)", alt_text or "", re.IGNORECASE)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < len(figure_urls):
+                    return figure_urls[idx]
+            return figure_urls[0]
+
+        def _repl(match: re.Match[str]) -> str:
+            alt = match.group(1) or ""
+            old_url = match.group(2) or ""
+            new_url = _pick_url(alt, old_url)
+            return f"![{alt}]({new_url})"
+
+        return img_pat.sub(_repl, markdown_text)
+
+    def _contains_cjk(text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+    def _rank_figures_for_method(figs: list[dict[str, str]], context_text: str) -> list[dict[str, str]]:
+        if not figs:
+            return []
+        ctx = (context_text or "").lower()
+        ctx_tokens = set(re.findall(r"[a-z][a-z0-9_-]{3,}", ctx))
+        stop = {
+            "this", "that", "with", "from", "into", "over", "under", "between", "using",
+            "paper", "study", "result", "results", "data", "model", "method", "methods",
+            "analysis", "approach", "based", "their", "these", "those", "which", "were",
+            "been", "have", "has", "into", "after", "before", "across", "section",
+        }
+        ctx_tokens = {t for t in ctx_tokens if t not in stop}
+
+        # Strong method-diagram indicators
+        method_terms_strong = {
+            "overview", "proposed", "schematic", "illustration", "diagram",
+            "pipeline", "framework", "architecture", "workflow",
+        }
+        # Moderate method indicators
+        method_terms_mod = {
+            "algorithm", "objective", "loss", "training", "inference", "module",
+            "backbone", "encoder", "decoder", "attention", "transformer",
+            "graph", "network", "component", "structure", "design",
+        }
+        # Result figures — still useful, give them a moderate boost
+        result_terms = {
+            "performance", "accuracy", "comparison", "benchmark",
+            "auroc", "auc", "f1", "precision", "recall", "roc curve",
+        }
+        # Truly irrelevant content to penalise
+        non_method_terms = {
+            "supplementary", "appendix",
+        }
+
+        def _score(fig: dict[str, str]) -> int:
+            cap = str(fig.get("caption", "") or "").lower()
+            url = str(fig.get("url", "") or "").lower()
+            src = str(fig.get("source", "") or "").lower()
+            text = f"{cap} {url}"
+            score = 0
+
+            for t in method_terms_strong:
+                if t in text:
+                    score += 6
+            for t in method_terms_mod:
+                if t in text:
+                    score += 3
+            for t in result_terms:
+                if t in text:
+                    score += 2  # result figures are now also valid to embed
+            for t in non_method_terms:
+                if t in text:
+                    score -= 3
+
+            # Bonus when caption explicitly says "our" / "we propose" — strong method signal
+            if re.search(r"\b(our|we propose|proposed method|proposed framework)\b", cap):
+                score += 5
+
+            # Overlap with paper method context keywords
+            fig_tokens = set(re.findall(r"[a-z][a-z0-9_-]{3,}", text))
+            overlap = len((fig_tokens & ctx_tokens) - stop)
+            score += min(overlap * 2, 12)  # doubled weight, higher cap
+
+            # Figure number heuristics: Fig 2-5 are prime method territory
+            fig_num_m = re.search(r"(?:figure|fig)[.\s]*(\d+)", cap)
+            if fig_num_m:
+                n = int(fig_num_m.group(1))
+                if 2 <= n <= 5:
+                    score += 3
+                elif n == 1:
+                    score -= 2  # Fig 1 is usually teaser/motivation
+                elif n >= 8:
+                    score -= 1  # late figures often results/supplementary
+
+            # Prefer richer-caption sources over raw PDF image dumps.
+            if src in {"arxiv", "html"}:
+                score += 3
+            elif src.startswith("pdf"):
+                score -= 1
+            # Penalize generic PDF captions (usually weakly informative).
+            if re.search(r"^pdf figure\s*\d+", cap):
+                score -= 4
+            return score
+
+        ranked = sorted(figs, key=_score, reverse=True)
+        return ranked
+
+    def _ai_reorder_figures_for_method(figs: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Use AI to pick the most method-relevant figures (best-effort)."""
+        if not figs or len(figs) < 2 or not api_key.strip():
+            return figs
+        try:
+            client = _make_openai_compatible_client(api_provider, api_key)
+            candidates = []
+            for i, f in enumerate(figs[:10], start=1):
+                candidates.append({
+                    "index": i,
+                    "caption": str(f.get("caption", "") or ""),
+                    "source": str(f.get("source", "") or ""),
+                    "url_hint": str(f.get("url", "") or "")[:120],
+                })
+            methods_text = str(report.get("methods_detailed", "") or "")[:600]
+            sys_prompt = (
+                "You are selecting figures for a paper review. "
+                "Choose figures that belong in either:\n"
+                "  (a) Method section: architecture/pipeline/framework/module diagrams\n"
+                "  (b) Results section: key quantitative or qualitative results of the paper's own method\n"
+                "AVOID: motivation figures (usually Fig 1), related-work illustrations, dataset overview, supplementary.\n"
+                "Return ONLY JSON: {\"indices\":[...]} with 1-based indices ordered by relevance, max 3 items."
+            )
+            payload = {
+                "title": title,
+                "abstract": abstract[:400],
+                "methods_summary": methods_text,
+                "candidates": candidates,
+            }
+            raw = _create_text_completion(
+                client=client,
+                provider=api_provider,
+                model=model.strip() or _default_model_for_provider(_normalize_api_provider(api_provider)),
+                system_prompt=sys_prompt,
+                user_content=json.dumps(payload, ensure_ascii=False),
+                max_output_tokens=120,
+                timeout=12,
+            )
+            s = raw.strip()
+            if "{" in s and "}" in s:
+                s = s[s.find("{"): s.rfind("}") + 1]
+            obj = json.loads(s)
+            idxs_raw = obj.get("indices", [])
+            if not isinstance(idxs_raw, list):
+                return figs
+            picked: list[int] = []
+            for x in idxs_raw:
+                try:
+                    iv = int(x)
+                except Exception:
+                    continue
+                if 1 <= iv <= len(figs) and iv not in picked:
+                    picked.append(iv)
+                if len(picked) >= 3:
+                    break
+            if not picked:
+                return figs
+            # Return ONLY the AI-selected figures first, then remaining
+            picked_set = set(picked)
+            head = [figs[i - 1] for i in picked]
+            tail = [f for j, f in enumerate(figs, start=1) if j not in picked_set]
+            return head + tail
+        except Exception:
+            return figs
+
+    def _is_generic_pdf_caption(fig: dict[str, str]) -> bool:
+        cap = str(fig.get("caption", "") or "").strip().lower()
+        src = str(fig.get("source", "") or "").strip().lower()
+        if not src.startswith("pdf"):
+            return False
+        return bool(re.match(r"^pdf figure\s*\d+(\s*\(page\s*\d+\))?$", cap))
+
     def _is_deep_enough(text: str) -> tuple[bool, str]:
         if not text.strip():
             return False, "empty output"
@@ -331,32 +1241,88 @@ def _generate_deep_md(
             return False, "missing Pros/Cons subsections"
         return True, ""
 
-    # Pre-fetch figures so AI can embed them inline
+    # Pre-fetch figures so AI can embed them inline.
+    # Collect from multiple sources, then rank globally for method relevance.
     figures_data: list[dict[str, str]] = []
+    figure_candidates: list[dict[str, str]] = []
+
+    def _append_figs(figs: list[dict[str, str]], source: str) -> None:
+        for f in figs:
+            u = str(f.get("url", "")).strip()
+            if not u:
+                continue
+            figure_candidates.append({
+                "url": u,
+                "caption": str(f.get("caption", "") or "").strip(),
+                "source": source,
+            })
+
     if paper_id.startswith("arxiv:"):
-        figures_data = _fetch_arxiv_figures(paper_id[6:], max_figs=6)
-    elif link:
-        figures_data = _fetch_page_figures(link, max_figs=4)
+        _append_figs(_fetch_arxiv_figures(paper_id[6:], max_figs=12), "arxiv")
+    if link:
+        _append_figs(_fetch_page_figures(link, max_figs=6), "html")
+    if local_pdf_path:
+        _append_figs(_extract_pdf_figures_from_file(Path(local_pdf_path), max_figs=3), "pdf_local")
+    for pdf_url in _candidate_pdf_urls(card):
+        _append_figs(_fetch_pdf_figures(pdf_url, max_figs=2), "pdf_remote")
+    _append_figs(_extract_figures_from_text(full_text, max_figs=4), "text")
+
+    # Deduplicate by URL while preserving first occurrence.
+    seen_fig_urls: set[str] = set()
+    for f in figure_candidates:
+        u = f.get("url", "")
+        if not u or u in seen_fig_urls:
+            continue
+        seen_fig_urls.add(u)
+        figures_data.append(f)
+
+    # If we have semantic sources (arXiv/HTML/text), avoid generic PDF crops as primary candidates.
+    has_semantic_sources = any(
+        str(f.get("source", "")).lower() in {"arxiv", "html", "text"}
+        for f in figures_data
+    )
+    if has_semantic_sources:
+        filtered = [f for f in figures_data if not _is_generic_pdf_caption(f)]
+        if filtered:
+            figures_data = filtered
+    if figures_data:
+        method_context = " ".join([
+            title or "",
+            abstract or "",
+            str(report.get("methods_detailed", "") or ""),
+            (full_text or "")[:3000],
+        ])
+        figures_data = _rank_figures_for_method(figures_data, method_context)
+        figures_data = _ai_reorder_figures_for_method(figures_data)
 
     if api_key.strip():
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key.strip())
+            client = _make_openai_compatible_client(api_provider, api_key)
 
             # Build figure reference block for the prompt
             if figures_data:
                 fig_ref_lines = []
-                for i, f in enumerate(figures_data):
+                for i, f in enumerate(figures_data[:4]):
                     cap = f["caption"] or f"Figure {i+1}"
-                    fig_ref_lines.append(f"Figure {i+1}: {cap}\nURL: {f['url']}")
+                    fig_ref_lines.append(f"Figure {i+1}: {cap}\nURL: {_prompt_safe_figure_url(str(f.get('url', '')))}")
                 fig_instructions = (
-                    "\n\nAVAILABLE FIGURES (embed inline using Markdown image syntax):\n"
+                    "\n\nAVAILABLE FIGURES (candidates, ranked by estimated method relevance):\n"
                     + "\n\n".join(fig_ref_lines)
-                    + "\n\nINSTRUCTION: Embed only relevant figures INLINE inside the content sections "
-                    "(especially Method Details and Summary) using:\n"
-                    "![Figure N: caption](url)\n"
-                    "Place each figure immediately after the paragraph that discusses it. "
-                    "Do NOT create a standalone figures-only section.\n"
+                    + "\n\nFIGURE EMBEDDING RULES (strict — read carefully):\n"
+                    "- Allowed placement: '## Method Details' (architecture/pipeline/framework diagrams) "
+                    "or '## Main Results' (key result plots that clearly support the paper's main claims). "
+                    "Match each figure to the section it best belongs to.\n"
+                    "- Only embed a figure if you are CONFIDENT it belongs: "
+                    "method figures show the paper's own architecture/pipeline/module design; "
+                    "result figures show the paper's own key quantitative or qualitative findings. "
+                    "When in doubt, DO NOT embed it.\n"
+                    "- NEVER embed: motivation/background figures, related-work illustrations, "
+                    "dataset overview figures, or supplementary figures.\n"
+                    "- If NONE of the available figures clearly fit either section, embed NOTHING — text-only is fine.\n"
+                    "- Embed at most 2 figures total across the entire review.\n"
+                    "- Place each figure immediately after the paragraph it illustrates.\n"
+                    "- Syntax: ![Figure N: caption](url)\n"
+                    "- Do NOT create a standalone figures section.\n"
                 )
             else:
                 fig_instructions = ""
@@ -383,8 +1349,12 @@ def _generate_deep_md(
                 "- Display equations: $$...$$\n"
                 "Never output raw LaTeX without $ delimiters.\n"
                 "### Data and Experimental Setup\n"
-                "Datasets, split, key metrics, and strongest baseline comparisons.\n"
-                "Embed relevant figures directly in this section when available.\n\n"
+                "Datasets, split, key metrics, and strongest baseline comparisons.\n\n"
+                "## Main Results\n"
+                "Key quantitative findings (about 100-160 words). Cover: best numbers on main benchmarks, "
+                "most important comparisons vs baselines, and one or two notable ablation findings if available. "
+                "Be specific — include actual numbers (e.g. '+2.3% AUROC over prior SOTA'). "
+                "Embed a result figure here if one is available and clearly informative.\n\n"
                 "## Summary\n"
                 "Keep this short (80-150 words): what we learned and why it matters.\n\n"
                 "## Future Direction\n"
@@ -412,22 +1382,27 @@ def _generate_deep_md(
                 "full_text": full_text,
             }, ensure_ascii=False)
 
-            primary_model = model.strip() or "gpt-4.1"
-            model_chain = [primary_model, "gpt-4.1-mini"]
+            provider_norm = _normalize_api_provider(api_provider)
+            primary_model = model.strip() or _default_model_for_provider(provider_norm)
+            if provider_norm == "gemini":
+                model_chain = [primary_model, "gemini-2.5-flash-lite"]
+            else:
+                model_chain = [primary_model, "gpt-4.1-mini"]
             # Deduplicate while preserving order
             model_chain = list(dict.fromkeys(model_chain))
 
             for m in model_chain:
-                resp = client.responses.create(
+                deep_max_tokens = 4000 if _normalize_api_provider(api_provider) == "gemini" else 8192
+                cand_raw = _create_text_completion(
+                    client=client,
+                    provider=api_provider,
                     model=m,
-                    input=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
-                    max_output_tokens=8192,
+                    system_prompt=sys_prompt,
+                    user_content=user_content,
+                    max_output_tokens=deep_max_tokens,
                     timeout=25,
                 )
-                cand = _normalize_math_delimiters((getattr(resp, "output_text", "") or "").strip())
+                cand = _normalize_math_delimiters(cand_raw)
                 ok, reason = _is_deep_enough(cand)
                 if ok:
                     md_body = cand
@@ -437,7 +1412,7 @@ def _generate_deep_md(
         except Exception as exc:
             ai_error = str(exc)
     else:
-        ai_error = "Missing OpenAI API key"
+        ai_error = "Missing API key for selected provider"
 
     # Parse TAGS line from first line of AI output
     tags: list[str] = []
@@ -448,15 +1423,25 @@ def _generate_deep_md(
             tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
             md_body = md_body[len(first_line):].lstrip("\n")
     md_body = _normalize_math_delimiters(md_body)
-    # If AI output omitted images but we found figures, inline a couple under Method Details.
+    md_body = _repair_image_links(md_body, figures_data)
+    # If AI output omitted images but we found figures, inline the most relevant one.
     if figures_data and "![" not in md_body:
-        fig_lines = []
-        for i, f in enumerate(figures_data[:2], start=1):
-            cap = f.get("caption") or f"Figure {i}"
-            fig_lines.append(f"![Figure {i}: {cap}]({f['url']})")
-        fig_block = "\n\n".join(fig_lines)
+        fig = figures_data[0]
+        cap = fig.get("caption") or "Figure 1"
+        fig_block = f"![Figure 1: {cap}]({fig['url']})"
+        cap_lower = cap.lower()
+        _result_kw = {"performance", "accuracy", "comparison", "benchmark",
+                      "auroc", "auc", "f1", "precision", "recall", "roc",
+                      "result", "table", "score", "improvement", "gain",
+                      "ablation", "evaluation"}
+        _method_kw = {"architecture", "framework", "pipeline", "overview",
+                      "diagram", "schematic", "illustration", "workflow",
+                      "proposed", "model", "network", "module", "structure"}
+        result_hits = sum(1 for w in _result_kw if w in cap_lower)
+        method_hits = sum(1 for w in _method_kw if w in cap_lower)
+        target_section = r"##\s+Main Results" if result_hits > method_hits else r"##\s+Method Details"
         md_body = re.sub(
-            r"(?ms)(##\s+Method Details[^\n]*\n)",
+            rf"(?ms)({target_section}[^\n]*\n)",
             r"\1\n" + fig_block + "\n\n",
             md_body,
             count=1,
@@ -476,7 +1461,7 @@ def _generate_deep_md(
         )
         if figures_data:
             fig_lines = []
-            for i, f in enumerate(figures_data[:2], start=1):
+            for i, f in enumerate(figures_data[:1], start=1):
                 cap = f.get("caption") or f"Figure {i}"
                 fig_lines.append(f"![Figure {i}: {cap}]({f['url']})")
             method_text = method_text + "\n\n" + "\n\n".join(fig_lines)
@@ -494,24 +1479,55 @@ def _generate_deep_md(
         parts.append(f"## Pros and Cons\n\n### Pros\n\n{pros}\n\n### Cons\n\n{cons}")
         md_body = "\n\n".join(parts) if parts else f"## AI Summary\n\nN/A\n\n## Abstract\n\n{abstract}"
 
-    # Score badges + short reasons
-    score_lines = []
+    # Scorecard (clean table + concise reasons)
+    score_rows = []
+    reason_lines = []
     reasons = scores.get("reasons") if isinstance(scores, dict) else None
     reasons = reasons if isinstance(reasons, dict) else {}
+    merged_reasons: dict[str, str] = {}
+    for k in ("relevance", "novelty", "rigor", "impact"):
+        rv = str(reasons.get(k, "")).strip()
+        if rv:
+            merged_reasons[k] = rv
+
+    need_ai_reasons = any(_score_reason_is_generic(merged_reasons.get(k, "")) for k in ("relevance", "novelty", "rigor", "impact"))
+    if need_ai_reasons:
+        ai_reason_map = _generate_ai_score_reasons(
+            api_provider=api_provider,
+            api_key=api_key,
+            model=model,
+            title=title,
+            venue=venue,
+            date=date,
+            abstract=abstract,
+            report=report,
+            full_text=full_text,
+            scores=scores if isinstance(scores, dict) else {},
+        )
+        for k, v in ai_reason_map.items():
+            if v:
+                merged_reasons[k] = v
+
     for k in ("relevance", "novelty", "rigor", "impact"):
         v = scores.get(k) if isinstance(scores, dict) else None
         if isinstance(v, (int, float)):
             iv = int(round(float(v)))
             bar = "█" * int(iv / 10) + "░" * (10 - int(iv / 10))
-            reason = str(reasons.get(k, "")).strip() or "-"
-            score_lines.append(f"| {k.capitalize()} | {bar} | {iv}/100 | {reason} |")
-    score_table = ""
-    if score_lines:
-        score_table = (
-            "\n| Dimension | Score | Value | Why |\n"
-            "|-----------|-------|-------|-----|\n"
-            + "\n".join(score_lines) + "\n"
+            reason = str(merged_reasons.get(k, "")).strip() or "-"
+            score_rows.append(f"| {k.capitalize()} | {iv}/100 | {bar} |")
+            if reason != "-":
+                reason_lines.append(f"- **{k.capitalize()}**: {reason}")
+    score_block = ""
+    if score_rows:
+        score_block = (
+            "\n## Scorecard\n\n"
+            "| Dimension | Value | Bar |\n"
+            "|-----------|-------|-----|\n"
+            + "\n".join(score_rows)
+            + "\n"
         )
+        if reason_lines:
+            score_block += "\n**Why these scores**\n\n" + "\n".join(reason_lines) + "\n"
 
     # Related papers — prefer previously summarized internal reports
     related_section = ""
@@ -523,6 +1539,10 @@ def _generate_deep_md(
             sim_venue = s.get("venue", "")
             sim_date = s.get("date", "")
             sim_summary = (s.get("summary", "") or "").strip()
+            # Keep deep report language clean: this report is generated in English.
+            # Historical archive summaries may be Chinese, so suppress those lines.
+            if _contains_cjk(sim_summary):
+                sim_summary = ""
             app_url = _find_paper_report_url(s.get("paper_id", ""), sim_title)
             if app_url:
                 linked = f"[{sim_title}]({app_url}) 📖 summarized"
@@ -554,8 +1574,10 @@ def _generate_deep_md(
         + f"# {title}\n\n"
         + f"> **{venue}** · {date}"
         + (f" · [Full Text →]({link})" if link else "")
+        + (f" · [Downloaded PDF]({downloaded_pdf_url})" if downloaded_pdf_url else "")
+        + (f" · [Source PDF]({source_pdf_url})" if (source_pdf_url and not downloaded_pdf_url) else "")
         + "\n"
-        + score_table
+        + score_block
         + "\n\n"
         + md_body
         + related_section
@@ -564,23 +1586,115 @@ def _generate_deep_md(
     return md
 
 
+def _externalize_data_uri_images(
+    md: str,
+    date_str: str,
+    day_dir: Path,
+    slug: str,
+    log_cb: Any | None = None,
+) -> str:
+    """Replace markdown data:image URIs with saved files under reports/{date}/assets."""
+    if "data:image/" not in md:
+        return md
+
+    assets_dir = day_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    seen_hash_to_name: dict[str, str] = {}
+    fig_idx = 0
+
+    def _mime_ext(mime: str) -> str:
+        m = mime.lower()
+        if m.endswith("jpeg") or m.endswith("jpg"):
+            return "jpg"
+        if m.endswith("webp"):
+            return "webp"
+        if m.endswith("gif"):
+            return "gif"
+        return "png"
+
+    pattern = re.compile(
+        r"!\[([^\]]*)\]\((data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\n\r]+))\)",
+        flags=re.IGNORECASE,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        nonlocal fig_idx
+        alt = match.group(1) or ""
+        mime_sub = match.group(3) or "png"
+        b64_data = (match.group(4) or "").replace("\n", "").replace("\r", "")
+        if not b64_data:
+            return match.group(0)
+        try:
+            raw = base64.b64decode(b64_data, validate=False)
+        except Exception:
+            return match.group(0)
+        if not raw:
+            return match.group(0)
+
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        fname = seen_hash_to_name.get(digest)
+        if not fname:
+            fig_idx += 1
+            ext = _mime_ext(mime_sub)
+            fname = f"{slug}_fig{fig_idx}_{digest}.{ext}"
+            out_path = assets_dir / fname
+            try:
+                out_path.write_bytes(raw)
+            except Exception:
+                return match.group(0)
+            seen_hash_to_name[digest] = fname
+            if callable(log_cb):
+                log_cb(f"🖼️ Saved embedded figure: {fname}")
+
+        url = f"/api/reports/{date_str}/assets/{fname}"
+        return f"![{alt}]({url})"
+
+    return pattern.sub(_repl, md)
+
+
 def _save_reports(
     date_str: str,
     report_cards: list[dict[str, Any]],
     also_notable: list[dict[str, Any]],
+    api_provider: str,
     api_key: str,
     model: str,
+    download_pdf: bool = True,
+    log_cb: Any | None = None,
 ) -> Path:
     """Write per-paper .md files and a digest.md to reports/{date}/."""
     day_dir = REPORTS_DIR / date_str
     day_dir.mkdir(parents=True, exist_ok=True)
 
     paper_files: list[tuple[dict, Path]] = []
-    for rc in report_cards:
-        md = _generate_deep_md(
-            rc, rc.get("report") or {}, rc.get("similar") or [], api_key, model
-        )
+    total = len(report_cards)
+    for idx, rc in enumerate(report_cards, start=1):
+        if callable(log_cb):
+            log_cb(f"📝 Saving deep report {idx}/{total}: {str(rc.get('title', ''))[:56]}…")
         slug = _safe_slug(rc.get("title", "paper"))
+        downloaded_pdf_url = ""
+        source_pdf_url = ""
+        if download_pdf:
+            downloaded_pdf_url, source_pdf_url = _maybe_download_pdf_for_report(rc, day_dir, slug, log_cb=log_cb)
+        local_pdf_file = _local_pdf_file_for_report(day_dir, slug)
+        if callable(log_cb) and downloaded_pdf_url:
+            log_cb(f"📄 PDF downloaded for report {idx}/{total}")
+        # Write back in-place so caller can re-save run with PDF URLs
+        if downloaded_pdf_url:
+            rc["downloaded_pdf_url"] = downloaded_pdf_url
+        md = _generate_deep_md(
+            rc,
+            rc.get("report") or {},
+            rc.get("similar") or [],
+            api_provider,
+            api_key,
+            model,
+            downloaded_pdf_url=downloaded_pdf_url,
+            source_pdf_url=source_pdf_url,
+            local_pdf_path=str(local_pdf_file) if local_pdf_file.exists() else "",
+        )
+        md = _externalize_data_uri_images(md, date_str=date_str, day_dir=day_dir, slug=slug, log_cb=log_cb)
         fpath = day_dir / f"{slug}.md"
         fpath.write_text(md, encoding="utf-8")
         paper_files.append((rc, fpath))
@@ -637,11 +1751,15 @@ def _save_reports(
 
 class Settings(BaseModel):
     language: str = "en"
+    timezone: str = "UTC"
     journals: list[str] = []
     custom_journals: list[str] = []
     fields: list[str] = []
+    download_pdf: bool = True
+    api_provider: str = "gemini"
     openai_api_key: str = ""
-    api_model: str = "gpt-4.1-mini"
+    gemini_api_key: str = ""
+    api_model: str = "gemini-2.5-flash-lite"
     max_reports: int = 5
     date_days: int = 3
     strict_journal: bool = True
@@ -673,12 +1791,18 @@ class SaveReportRequest(BaseModel):
     content: str
 
 
+class CachePdfRequest(BaseModel):
+    date: str
+    card: dict[str, Any]
+
+
 # ── Note generation ────────────────────────────────────────────────────────
 
 def _generate_note(
     card: dict[str, Any],
     report: dict[str, Any],
     similar: list[dict[str, Any]],
+    api_provider: str,
     api_key: str,
     model: str,
 ) -> str:
@@ -694,8 +1818,7 @@ def _generate_note(
 
     if api_key.strip():
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key.strip())
+            client = _make_openai_compatible_client(api_provider, api_key)
 
             sys_prompt = (
                 "You are a research reading assistant. Based on the paper information provided, "
@@ -708,21 +1831,20 @@ def _generate_note(
                 "## Reflections\n(significance to the field + 1–2 open questions worth pursuing)"
             )
 
-            resp = client.responses.create(
-                model=model or "gpt-4.1-mini",
-                input=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": json.dumps({
-                        "title": title, "venue": venue, "date": date,
-                        "abstract": abstract,
-                        "methods": report.get("methods_detailed", ""),
-                        "conclusion": report.get("main_conclusion", ""),
-                        "full_text": (card.get("source_content", "") or "")[:15000],
-                    }, ensure_ascii=False)},
-                ],
+            note_body = _create_text_completion(
+                client=client,
+                provider=api_provider,
+                model=model or _default_model_for_provider(api_provider),
+                system_prompt=sys_prompt,
+                user_content=json.dumps({
+                    "title": title, "venue": venue, "date": date,
+                    "abstract": abstract,
+                    "methods": report.get("methods_detailed", ""),
+                    "conclusion": report.get("main_conclusion", ""),
+                    "full_text": (card.get("source_content", "") or "")[:15000],
+                }, ensure_ascii=False),
                 max_output_tokens=1200,
             )
-            note_body = (getattr(resp, "output_text", "") or "").strip()
         except Exception:
             pass
 
@@ -807,14 +1929,24 @@ def _generate_note(
 @app.get("/api/settings")
 def get_settings() -> dict[str, Any]:
     cfg = _load_config()
+    provider = _normalize_api_provider(cfg.get("api_provider", os.getenv("DEFAULT_API_PROVIDER", "gemini")))
+    timezone = _normalize_timezone(cfg.get("timezone", os.getenv("APP_TIMEZONE", "UTC")))
     return {
+        "app_mode": _app_mode(),
+        "beta_daily_note_limit": _beta_note_daily_limit(),
+        "beta_forced_model": _beta_forced_model() if _is_beta_mode() else "",
         "language": cfg.get("language", "en"),
+        "timezone": timezone,
         "journals": cfg.get("journals", []),
         "custom_journals": cfg.get("custom_journals", []),
         "fields": cfg.get("fields", []),
-        "openai_api_key": cfg.get("openai_api_key", os.getenv("OPENAI_API_KEY", "")),
-        "api_model": cfg.get("api_model", "gpt-4.1-mini"),
-        "max_reports": cfg.get("max_reports", 5),
+        "download_pdf": bool(cfg.get("download_pdf", True)),
+        "api_provider": provider,
+        # Never expose env-level default API key to clients.
+        "openai_api_key": cfg.get("openai_api_key", ""),
+        "gemini_api_key": cfg.get("gemini_api_key", ""),
+        "api_model": _effective_model(cfg.get("api_model", _default_model_for_provider(provider)), provider),
+        "max_reports": _clamp_max_reports(cfg.get("max_reports", 5)),
         "date_days": cfg.get("date_days", 3),
         "strict_journal": cfg.get("strict_journal", True),
         "exclude_keywords": cfg.get("exclude_keywords", ""),
@@ -828,7 +1960,13 @@ def get_settings() -> dict[str, Any]:
 @app.put("/api/settings")
 def save_settings(body: Settings) -> dict[str, Any]:
     cfg = _load_config()
-    cfg.update(body.model_dump())
+    data = body.model_dump()
+    provider = _normalize_api_provider(data.get("api_provider", "gemini"))
+    data["api_provider"] = provider
+    data["timezone"] = _normalize_timezone(data.get("timezone", "UTC"))
+    data["api_model"] = _effective_model(data.get("api_model"), provider)
+    data["max_reports"] = _clamp_max_reports(data.get("max_reports", 5))
+    cfg.update(data)
     if not cfg.get("archive_db"):
         cfg["archive_db"] = DEFAULT_ARCHIVE
     _save_config(cfg)
@@ -901,8 +2039,30 @@ def list_report_files(date: str) -> dict[str, Any]:
     day_dir = REPORTS_DIR / date
     if not day_dir.exists():
         raise HTTPException(status_code=404, detail="No reports for this date")
+    def _parse_meta(path: Path) -> tuple[str, list[str]]:
+        title = path.stem
+        tags: list[str] = []
+        try:
+            text = path.read_text("utf-8", errors="ignore")
+            m = re.match(r"(?s)^---\n(.*?)\n---\n", text)
+            if m:
+                fm = m.group(1)
+                t = re.search(r'^title:\s*"?([^"\n]+)"?\s*$', fm, re.MULTILINE)
+                if t:
+                    title = t.group(1).strip()
+                tagm = re.search(r"^tags:\s*\[([^\]]*)\]\s*$", fm, re.MULTILINE)
+                if tagm:
+                    tags = [
+                        x.strip().strip('"').strip("'")
+                        for x in tagm.group(1).split(",")
+                        if x.strip()
+                    ]
+        except Exception:
+            pass
+        return title, tags
+
     files = [
-        {"name": f.name, "size": f.stat().st_size}
+        (lambda title, tags: {"name": f.name, "size": f.stat().st_size, "title": title, "tags": tags})(*_parse_meta(f))
         for f in sorted(day_dir.glob("*.md"))
     ]
     return {"date": date, "path": str(day_dir), "files": files}
@@ -910,6 +2070,9 @@ def list_report_files(date: str) -> dict[str, Any]:
 
 @app.get("/api/reports/{date}/{filename}")
 def get_report_file(date: str, filename: str) -> dict[str, Any]:
+    # "assets" is a sub-collection, not a file — delegate to list endpoint
+    if filename == "assets":
+        return list_report_assets(date)  # type: ignore[return-value]
     if not filename.endswith(".md") or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
     fpath = REPORTS_DIR / date / filename
@@ -921,6 +2084,44 @@ def get_report_file(date: str, filename: str) -> dict[str, Any]:
         "path": str(fpath),
         "content": fpath.read_text("utf-8"),
     }
+
+
+@app.get("/api/reports/{date}/assets/{filename}")
+def get_report_asset(date: str, filename: str):
+    if ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    ext = Path(filename).suffix.lower()
+    media_map = {
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }
+    media_type = media_map.get(ext)
+    if not media_type:
+        raise HTTPException(status_code=400, detail="Unsupported asset type")
+    fpath = REPORTS_DIR / date / "assets" / filename
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return FileResponse(
+        path=str(fpath),
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@app.get("/api/reports/{date}/assets")
+def list_report_assets(date: str) -> dict[str, Any]:
+    assets_dir = REPORTS_DIR / date / "assets"
+    if not assets_dir.exists():
+        return {"date": date, "files": []}
+    files = [
+        {"name": f.name, "size": f.stat().st_size}
+        for f in sorted(assets_dir.glob("*.pdf"))
+    ]
+    return {"date": date, "files": files}
 
 
 @app.put("/api/reports/{date}/{filename}")
@@ -1102,16 +2303,22 @@ def delete_note(slug: str) -> dict[str, Any]:
 @app.post("/api/papers/note")
 async def generate_note(body: NoteRequest) -> dict[str, Any]:
     """Generate a structured AI paper note, save to notes/, and link it from report."""
-    api_key = body.settings.openai_api_key or os.getenv("OPENAI_API_KEY", "")
-    model = body.settings.api_model or "gpt-4.1-mini"
+    tz_name = _normalize_timezone(body.settings.timezone)
+    _check_beta_note_limit_or_raise(tz_name)
+    api_provider, api_key = _resolve_provider_and_key(
+        body.settings.api_provider,
+        body.settings.openai_api_key,
+        body.settings.gemini_api_key,
+    )
+    model = _effective_model(body.settings.api_model, api_provider)
     card = dict(body.card)
     card["link"] = _best_link(card)
 
-    note_md = _generate_note(card, body.report, body.similar, api_key, model)
+    note_md = _generate_note(card, body.report, body.similar, api_provider, api_key, model)
 
     # Save note into NOTES_DIR and pin it under "AI Paper Notes" folder metadata.
     base_slug = _safe_slug(card.get("title", "paper"), max_len=40)
-    date_tag = re.sub(r"[^0-9]", "", body.date) or datetime.now(UTC).strftime("%Y%m%d")
+    date_tag = re.sub(r"[^0-9]", "", body.date) or datetime.now(ZoneInfo(tz_name)).strftime("%Y%m%d")
     note_slug = f"ai_paper_note_{date_tag}_{base_slug}"
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
     note_path = NOTES_DIR / f"{note_slug}.md"
@@ -1139,6 +2346,8 @@ async def generate_note(body: NoteRequest) -> dict[str, Any]:
         except Exception:
             pass
 
+    _mark_beta_note_usage(tz_name)
+
     return {
         "ok": True,
         "slug": note_slug,
@@ -1156,8 +2365,12 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
     s = body.settings
     card = dict(body.card)
     date_str = body.date
-    api_key = s.openai_api_key or os.getenv("OPENAI_API_KEY", "")
-    model = s.api_model or "gpt-4.1-mini"
+    api_provider, api_key = _resolve_provider_and_key(
+        s.api_provider,
+        s.openai_api_key,
+        s.gemini_api_key,
+    )
+    model = _effective_model(s.api_model, api_provider)
 
     cfg = _load_config()
     archive_db = s.archive_db or cfg.get("archive_db", DEFAULT_ARCHIVE)
@@ -1165,7 +2378,9 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
     settings_dict: dict[str, Any] = {
         "language": (s.language or "en"),
         "keywords": "",
+        "api_provider": api_provider,
         "openai_api_key": api_key,
+        "gemini_api_key": api_key if api_provider == "gemini" else "",
         "api_model": model,
     }
 
@@ -1215,8 +2430,24 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
     try:
         day_dir = REPORTS_DIR / date_str
         day_dir.mkdir(parents=True, exist_ok=True)
-        md = _generate_deep_md(card, report, similar, api_key, model)
         slug = _safe_slug(card.get("title", "paper"))
+        downloaded_pdf_url = ""
+        source_pdf_url = ""
+        if s.download_pdf:
+            downloaded_pdf_url, source_pdf_url = _maybe_download_pdf_for_report(card, day_dir, slug)
+        local_pdf_file = _local_pdf_file_for_report(day_dir, slug)
+        md = _generate_deep_md(
+            card,
+            report,
+            similar,
+            api_provider,
+            api_key,
+            model,
+            downloaded_pdf_url=downloaded_pdf_url,
+            source_pdf_url=source_pdf_url,
+            local_pdf_path=str(local_pdf_file) if local_pdf_file.exists() else "",
+        )
+        md = _externalize_data_uri_images(md, date_str=date_str, day_dir=day_dir, slug=slug)
         fpath = day_dir / f"{slug}.md"
         fpath.write_text(md, encoding="utf-8")
         md_path = str(fpath)
@@ -1253,6 +2484,26 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
         pass
 
     return {"ok": True, "report": report, "md_path": md_path, "card": card}
+
+
+@app.post("/api/papers/cache-pdf")
+def cache_pdf(body: CachePdfRequest) -> dict[str, Any]:
+    """Attempt to download/cache a paper PDF under reports/{date}/assets/ and return local URL."""
+    card = dict(body.card or {})
+    title = card.get("title", "")
+    if not title:
+        raise HTTPException(status_code=400, detail="Missing card.title")
+    day_dir = REPORTS_DIR / body.date
+    day_dir.mkdir(parents=True, exist_ok=True)
+    slug = _safe_slug(title)
+    ok, local_url, detail = _try_download_pdf_for_report(card, day_dir, slug)
+    return {
+        "ok": ok,
+        "downloaded_pdf_url": local_url,
+        "source_pdf_url": detail if ok else "",
+        "reason": "" if ok else detail,
+        "slug": slug,
+    }
 
 
 # ── Network / similarity endpoints ────────────────────────────────────────
@@ -1407,15 +2658,19 @@ def run_pipeline(body: RunPipelineRequest) -> dict[str, Any]:
         if _pipeline_state["status"] == "running":
             return {"started": False, "reason": "already_running"}
 
-    # Check if today's run already exists (unless force=True)
-    if not body.force:
-        today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-        _cfg = _load_config()
-        _archive_db = body.settings.archive_db or _cfg.get("archive_db", DEFAULT_ARCHIVE)
+    cfg = _load_config()
+    tz_name = _normalize_timezone(body.settings.timezone or str(cfg.get("timezone", "")))
+
+    # Check if today's run already exists.
+    # In beta mode, force override is disabled to enforce daily quota.
+    if _is_beta_mode() or (not body.force):
+        today_str = _today_in_tz(tz_name)
+        _archive_db = body.settings.archive_db or cfg.get("archive_db", DEFAULT_ARCHIVE)
         try:
             from paper_archive import get_run as _get_run
             if _get_run(_archive_db, today_str) is not None:
-                return {"started": False, "reason": "already_run_today", "date": today_str}
+                reason = "beta_daily_limit" if _is_beta_mode() else "already_run_today"
+                return {"started": False, "reason": reason, "date": today_str}
         except Exception:
             pass  # DB not ready yet — proceed normally
 
@@ -1432,10 +2687,16 @@ def run_pipeline(body: RunPipelineRequest) -> dict[str, Any]:
         })
 
     s = body.settings
-    cfg = _load_config()
+    api_provider, api_key = _resolve_provider_and_key(
+        s.api_provider,
+        s.openai_api_key or str(cfg.get("openai_api_key", "")),
+        s.gemini_api_key or str(cfg.get("gemini_api_key", "")),
+    )
+    model = _effective_model(s.api_model, api_provider)
 
     settings_dict: dict[str, Any] = {
         "language": (s.language or "en"),
+        "timezone": tz_name,
         "keywords": "",
         "exclude_keywords": s.exclude_keywords,
         "journals": s.journals + s.custom_journals,
@@ -1443,27 +2704,29 @@ def run_pipeline(body: RunPipelineRequest) -> dict[str, Any]:
         "push_schedule": "daily",
         "custom_days": s.date_days,
         "date_range_days": s.date_days,
-        "openai_api_key": s.openai_api_key or cfg.get("openai_api_key", os.getenv("OPENAI_API_KEY", "")),
-        "api_model": s.api_model,
+        "api_provider": api_provider,
+        # Keep compatibility with legacy generator that reads only openai_api_key.
+        "openai_api_key": api_key,
+        "gemini_api_key": api_key if api_provider == "gemini" else "",
+        "api_model": model,
         "enable_webhook_push": bool((s.webhook_url or "").strip()),
         "webhook_url": s.webhook_url,
     }
     archive_db = s.archive_db or cfg.get("archive_db", DEFAULT_ARCHIVE)
-    api_key = settings_dict["openai_api_key"]
-    model = s.api_model
-    max_reports = s.max_reports
+    max_reports = _clamp_max_reports(s.max_reports)
 
     def _run() -> None:
         try:
             from research_pipeline import (
                 DEFAULT_SIMILAR_LIMIT,
                 _build_slack_text,
+                _deliver,
                 _generate_report,
             )
             from paper_archive import find_similar, init_archive, store_paper, store_run, archive_size
             from app import build_digest, build_runtime_prefs_from_settings, fetch_candidates
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            from datetime import UTC, datetime
+            from datetime import datetime
 
             _pipeline_log("📡 Fetching papers from RSS feeds…")
 
@@ -1541,19 +2804,45 @@ def run_pipeline(body: RunPipelineRequest) -> dict[str, Any]:
                                 report={})
                     also_for_push.append(c)
 
-            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
+            date_str = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
             slack_text = _build_slack_text(
                 date_str=date_str,
                 report_cards=report_cards,
                 also_notable=also_for_push,
                 total_fetched=len(all_cards),
-                lang="zh",
+                lang=str(settings_dict.get("language", "en")),
             )
             store_run(archive_db, date_str, report_cards, also_for_push, slack_text)
 
+            # Deliver digest via webhook when configured.
+            try:
+                ok_push, push_msg = _deliver(
+                    webhook_override="",
+                    settings=settings_dict,
+                    lang=str(settings_dict.get("language", "en")),
+                    date_str=date_str,
+                    text=slack_text,
+                    digest=digest,
+                )
+                if ok_push:
+                    _pipeline_log(f"📬 Webhook push sent: {push_msg}")
+                else:
+                    _pipeline_log(f"⚠️ Webhook push skipped/failed: {push_msg}")
+            except Exception as push_exc:
+                _pipeline_log(f"⚠️ Webhook push error: {push_exc}")
+
             _pipeline_log("📝 Saving markdown reports…")
             try:
-                _save_reports(date_str, report_cards, also_for_push, api_key, model)
+                _save_reports(
+                    date_str,
+                    report_cards,
+                    also_for_push,
+                    api_provider,
+                    api_key,
+                    model,
+                    download_pdf=bool(s.download_pdf),
+                    log_cb=_pipeline_log,
+                )
                 _pipeline_log(f"📁 Reports saved to reports/{date_str}/ ({len(report_cards)} files)")
             except Exception as md_exc:
                 _pipeline_log(f"⚠️ MD save failed: {md_exc}")

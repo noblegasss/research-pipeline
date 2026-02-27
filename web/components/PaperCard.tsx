@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ChevronDown, ChevronUp, ExternalLink, FileText } from "lucide-react";
 import ScoreBar from "./ScoreBar";
@@ -14,6 +14,11 @@ interface Props {
   date?: string;
 }
 
+function safeMarkdownUrlTransform(url: string): string {
+  if (/^data:image\/[\w.+-]+;base64,/i.test(url)) return url;
+  return defaultUrlTransform(url);
+}
+
 function Section({ icon, title, content }: { icon: string; title: string; content: string }) {
   if (!content) return null;
   return (
@@ -22,7 +27,9 @@ function Section({ icon, title, content }: { icon: string; title: string; conten
         {icon} {title}
       </h4>
       <div className="prose prose-sm text-[#3a3631]">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={safeMarkdownUrlTransform}>
+          {content}
+        </ReactMarkdown>
       </div>
     </div>
   );
@@ -34,6 +41,19 @@ function _safeSlug(text: string, maxLen = 60): string {
     .replace(/[\s_-]+/g, "_")
     .replace(/^_|_$/g, "")
     .slice(0, maxLen) || "paper";
+}
+
+function _pdfLink(card: PaperCardType): string {
+  if (card.downloaded_pdf_url) return card.downloaded_pdf_url;
+  const link = (card.link || "").trim();
+  const pid = (card.paper_id || "").trim();
+  if (link.toLowerCase().endsWith(".pdf")) return link;
+  if (pid.startsWith("arxiv:")) return `https://arxiv.org/pdf/${pid.slice(6)}.pdf`;
+  if ((/biorxiv\.org\/content\//i.test(link) || /medrxiv\.org\/content\//i.test(link))) {
+    const base = link.split("?", 1)[0].replace(/\/+$/, "");
+    return `${base}.full.pdf`;
+  }
+  return "";
 }
 
 export default function PaperCard({ card, index, defaultOpen = false, date }: Props) {
@@ -49,6 +69,7 @@ export default function PaperCard({ card, index, defaultOpen = false, date }: Pr
   const aiSum = rpt.ai_feed_summary || card.ai_feed_summary || "";
   const scores = card.scores ?? {};
   const link = card.link;
+  const pdfLink = _pdfLink(card);
 
   const hasReport = Boolean(methods || conclusion || aiSum);
   const mdSlug = date ? _safeSlug(card.title) : null;
@@ -75,6 +96,15 @@ export default function PaperCard({ card, index, defaultOpen = false, date }: Pr
                 {card.venue}
               </span>
             )}
+            {Array.from(new Set(card.tags || [])).slice(0, 4).map((tag) => (
+              <span
+                key={tag}
+                className="text-xs px-2 py-0.5 rounded-full border"
+                style={{ background: "#eef2fb", color: "#3b5ea6", borderColor: "#c7d4f0" }}
+              >
+                #{tag}
+              </span>
+            ))}
             {card.date && <span className="text-xs text-[#8e887f]">📅 {card.date}</span>}
             {typeof scores.total === "number" && (
               <span
@@ -97,6 +127,19 @@ export default function PaperCard({ card, index, defaultOpen = false, date }: Pr
               <FileText size={11} />
               Deep Report
             </button>
+          )}
+          {pdfLink && (
+            <a
+              href={pdfLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md transition-colors border"
+              style={{ background: "#f5f7ff", color: "#2b4ea2", borderColor: "#ced8f3" }}
+              title="Open PDF"
+            >
+              <FileText size={11} />
+              PDF
+            </a>
           )}
           {link && (
             <a

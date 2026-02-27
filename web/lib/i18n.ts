@@ -8,6 +8,7 @@ const dict: Record<Language, Record<string, string>> = {
   en: {
     settings: "Settings",
     paper_network: "Paper Network",
+    report_search: "Report Search",
     papers: "Papers",
     daily_digest: "Daily Digest",
     notes: "Notes",
@@ -30,6 +31,7 @@ const dict: Record<Language, Record<string, string>> = {
   zh: {
     settings: "设置",
     paper_network: "论文网络",
+    report_search: "报告检索",
     papers: "论文",
     daily_digest: "每日摘要",
     notes: "笔记",
@@ -62,7 +64,7 @@ export function useI18n() {
   const [lang, setLang] = useState<Language>("en");
 
   useEffect(() => {
-    setLang(getLanguage());
+    queueMicrotask(() => setLang(getLanguage()));
     const update = () => setLang(getLanguage());
     const onStorage = (e: StorageEvent) => {
       if (!e.key || e.key === "research_pipeline_settings_v1") update();

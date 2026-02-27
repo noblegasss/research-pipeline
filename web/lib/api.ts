@@ -34,6 +34,7 @@ export interface PaperCard {
   venue: string;
   date: string;
   link: string;
+  downloaded_pdf_url?: string;
   scores?: ScoreMap;
   source_abstract?: string;
   report?: Report;
@@ -57,10 +58,14 @@ export interface RunData {
 
 export interface AppSettings {
   language: "en" | "zh";
+  timezone: string;
   journals: string[];
   custom_journals: string[];
   fields: string[];
+  download_pdf: boolean;
+  api_provider: "openai" | "gemini";
   openai_api_key: string;
+  gemini_api_key: string;
   api_model: string;
   max_reports: number;
   date_days: number;
@@ -366,13 +371,26 @@ export const FIELD_OPTIONS_DEFAULT = [
 
 const SETTINGS_KEY = "research_pipeline_settings_v1";
 
+function detectBrowserTimezone(): string {
+  if (typeof window === "undefined") return "UTC";
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
 const DEFAULT_SETTINGS: AppSettings = {
   language: "en",
+  timezone: "UTC",
   journals: [],
   custom_journals: [],
   fields: [],
+  download_pdf: true,
+  api_provider: "gemini",
   openai_api_key: "",
-  api_model: "gpt-4.1-mini",
+  gemini_api_key: "",
+  api_model: "gemini-2.5-flash-lite",
   max_reports: 5,
   date_days: 3,
   strict_journal: true,
@@ -391,13 +409,28 @@ export function loadLocalSettings(): AppSettings {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
-    return {
+    const merged = {
       ...DEFAULT_SETTINGS,
       ...parsed,
+      timezone: (parsed.timezone || detectBrowserTimezone()),
       // always keep full option lists client-side
       journal_options: JOURNAL_OPTIONS_DEFAULT,
       field_options: FIELD_OPTIONS_DEFAULT,
     };
+    // One-time migration for older localStorage without provider field.
+    if (!("api_provider" in parsed)) {
+      merged.api_provider = parsed.openai_api_key ? "openai" : "gemini";
+      if (!parsed.api_model) {
+        merged.api_model = merged.api_provider === "gemini" ? "gemini-2.5-flash-lite" : "gpt-4.1-mini";
+      }
+    }
+    if (!parsed.timezone) {
+      merged.timezone = detectBrowserTimezone();
+    }
+    if (merged.api_provider === "gemini" && ["gemini-2.0-flash-lite", "gemini-2.0-flash"].includes(merged.api_model)) {
+      merged.api_model = "gemini-2.5-flash-lite";
+    }
+    return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -406,7 +439,9 @@ export function loadLocalSettings(): AppSettings {
 export function saveLocalSettings(s: AppSettings): void {
   if (typeof window === "undefined") return;
   // Don't persist the static option lists — they're always re-injected on load
-  const { journal_options: _j, field_options: _f, ...rest } = s;
+  const { journal_options, field_options, ...rest } = s;
+  void journal_options;
+  void field_options;
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(rest));
 }
 
@@ -424,6 +459,13 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 export interface ReportDate {
   date: string;
   files: number;
+}
+
+export interface ReportFileMeta {
+  name: string;
+  size: number;
+  title?: string;
+  tags?: string[];
 }
 
 export interface NoteMeta {
@@ -487,7 +529,11 @@ export const api = {
 
   /** List report files for a date */
   listReports: (date: string) =>
-    apiFetch<{ date: string; path: string; files: { name: string; size: number }[] }>(`/api/reports/${date}`),
+    apiFetch<{ date: string; path: string; files: ReportFileMeta[] }>(`/api/reports/${date}`),
+
+  /** List downloaded PDF assets for a report date */
+  listReportAssets: (date: string) =>
+    apiFetch<{ date: string; files: { name: string; size: number }[] }>(`/api/reports/${date}/assets`),
 
   /** Save edited markdown content back to file */
   saveReport: (date: string, filename: string, content: string) =>
@@ -519,6 +565,17 @@ export const api = {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ date, card, settings }),
+      }
+    ),
+
+  /** Try downloading/caching local PDF for a deep-read card */
+  cachePaperPdf: (date: string, card: PaperCard) =>
+    apiFetch<{ ok: boolean; downloaded_pdf_url?: string; source_pdf_url?: string; slug?: string; reason?: string }>(
+      `/api/papers/cache-pdf`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, card }),
       }
     ),
 

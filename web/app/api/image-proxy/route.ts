@@ -22,12 +22,13 @@ export async function GET(req: NextRequest) {
   }
 
   try {
+    const referer = `${parsed.protocol}//${parsed.host}/`;
     const upstream = await fetch(parsed.toString(), {
       headers: {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "image/webp,image/avif,image/*,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://ar5iv.labs.arxiv.org/",
+        "Referer": referer,
       },
       redirect: "follow",
       signal: AbortSignal.timeout(15_000),
@@ -50,8 +51,9 @@ export async function GET(req: NextRequest) {
         "X-Proxied-From": parsed.hostname,
       },
     });
-  } catch (err: any) {
-    return new NextResponse(`Proxy error: ${err?.message || "Unknown"}`, {
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Unknown";
+    return new NextResponse(`Proxy error: ${msg}`, {
       status: 502,
     });
   }
