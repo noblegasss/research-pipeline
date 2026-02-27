@@ -1,10 +1,11 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ChevronDown, ChevronUp, ExternalLink, FileText } from "lucide-react";
+import { ChevronDown, ChevronUp, ExternalLink, FileText, MoreHorizontal, Undo2 } from "lucide-react";
 import ScoreBar from "./ScoreBar";
+import { api } from "@/lib/api";
 import type { PaperCard as PaperCardType } from "@/lib/api";
 
 interface Props {
@@ -12,6 +13,7 @@ interface Props {
   index: number;
   defaultOpen?: boolean;
   date?: string;
+  onDemoted?: (card: PaperCardType) => void;
 }
 
 function safeMarkdownUrlTransform(url: string): string {
@@ -56,10 +58,13 @@ function _pdfLink(card: PaperCardType): string {
   return "";
 }
 
-export default function PaperCard({ card, index, defaultOpen = false, date }: Props) {
+export default function PaperCard({ card, index, defaultOpen = false, date, onDemoted }: Props) {
   const router = useRouter();
   const [open, setOpen] = useState(defaultOpen);
   const [showAbstract, setShowAbstract] = useState(false);
+  const [demoting, setDemoting] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   const rpt = card.report ?? {};
   const methods = rpt.methods_detailed || card.methods_in_one_line || "";
@@ -73,6 +78,20 @@ export default function PaperCard({ card, index, defaultOpen = false, date }: Pr
 
   const hasReport = Boolean(methods || conclusion || aiSum);
   const mdSlug = date ? _safeSlug(card.title) : null;
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!menuOpen) return;
+    function handle(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [menuOpen]);
+
+  const hasOverflow = Boolean(pdfLink || (date && onDemoted));
 
   return (
     <article className="border rounded-xl mb-3 overflow-hidden transition-all hover:-translate-y-[1px]"
@@ -115,8 +134,10 @@ export default function PaperCard({ card, index, defaultOpen = false, date }: Pr
             )}
           </div>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
-          {/* MD report button */}
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-1.5 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
+          {/* Deep Report — primary */}
           {date && mdSlug && hasReport && (
             <button
               onClick={() => router.push(`/reports/${date}/${mdSlug}`)}
@@ -128,31 +149,75 @@ export default function PaperCard({ card, index, defaultOpen = false, date }: Pr
               Deep Report
             </button>
           )}
-          {pdfLink && (
-            <a
-              href={pdfLink}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md transition-colors border"
-              style={{ background: "#f5f7ff", color: "#2b4ea2", borderColor: "#ced8f3" }}
-              title="Open PDF"
-            >
-              <FileText size={11} />
-              PDF
-            </a>
-          )}
+
+          {/* Read — primary */}
           {link && (
             <a
               href={link}
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center gap-1 text-xs text-white px-3 py-1.5 rounded-md transition-colors"
+              className="flex items-center gap-1 text-xs text-white px-2.5 py-1.5 rounded-md transition-colors"
               style={{ background: "linear-gradient(135deg, #2d2b28 0%, #4a453f 100%)" }}
             >
               <ExternalLink size={11} />
               Read
             </a>
           )}
+
+          {/* ··· overflow menu */}
+          {hasOverflow && (
+            <div className="relative" ref={menuRef}>
+              <button
+                onClick={() => setMenuOpen((s) => !s)}
+                className="flex items-center justify-center w-7 h-7 rounded-md border transition-colors"
+                style={{ background: "#f0ede4", borderColor: "#dcd6c8", color: "#7e776d" }}
+                title="More options"
+              >
+                <MoreHorizontal size={13} />
+              </button>
+              {menuOpen && (
+                <div
+                  className="absolute right-0 top-full mt-1 z-50 min-w-[140px] rounded-lg border py-1 shadow-lg"
+                  style={{ background: "#fdfcf9", borderColor: "#e0dbd0" }}
+                >
+                  {pdfLink && (
+                    <a
+                      href={pdfLink}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={() => setMenuOpen(false)}
+                      className="flex items-center gap-2 px-3 py-2 text-xs hover:bg-[#f0ede4] transition-colors"
+                      style={{ color: "#2b4ea2" }}
+                    >
+                      <FileText size={11} />
+                      Open PDF
+                    </a>
+                  )}
+                  {date && onDemoted && (
+                    <button
+                      disabled={demoting}
+                      onClick={async () => {
+                        setMenuOpen(false);
+                        setDemoting(true);
+                        try {
+                          await api.demotePaper(date, card);
+                          onDemoted(card);
+                        } catch {
+                          setDemoting(false);
+                        }
+                      }}
+                      className="flex items-center gap-2 px-3 py-2 text-xs w-full text-left hover:bg-[#f0ede4] transition-colors disabled:opacity-50"
+                      style={{ color: "#a04a1e" }}
+                    >
+                      <Undo2 size={11} />
+                      {demoting ? "Moving…" : "Move to Notable"}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {open ? <ChevronUp size={15} className="text-[#918b82]" /> : <ChevronDown size={15} className="text-[#918b82]" />}
         </div>
       </header>

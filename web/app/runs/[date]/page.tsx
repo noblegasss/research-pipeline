@@ -178,6 +178,15 @@ export default function RunPage({ params }: { params: Promise<{ date: string }> 
     setNotable((prev) => prev.filter((c) => c.paper_id !== card.paper_id));
   }, []);
 
+  const handleDemoted = useCallback((card: PaperCardData) => {
+    setExtraCards((prev) => prev.filter((c) => c.paper_id !== card.paper_id));
+    setRun((prev) => prev ? {
+      ...prev,
+      report_cards: prev.report_cards.filter((c) => c.paper_id !== card.paper_id),
+    } : prev);
+    setNotable((prev) => [card, ...prev.filter((c) => c.paper_id !== card.paper_id)]);
+  }, []);
+
   if (loading) return (
     <div className="flex items-center justify-center h-64 text-[#8e887f] text-sm">Loading {date}…</div>
   );
@@ -226,6 +235,7 @@ export default function RunPage({ params }: { params: Promise<{ date: string }> 
               index={i + 1}
               defaultOpen={i === 0}
               date={date}
+              onDemoted={handleDemoted}
             />
           ))}
         </section>

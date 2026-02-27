@@ -10,6 +10,7 @@ import asyncio
 import base64
 import hashlib
 import io
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -63,7 +64,66 @@ DEFAULT_ARCHIVE = os.getenv("RESEARCH_ARCHIVE_DB", str(_PIPELINE_DIR / "paper_ar
 REPORTS_DIR = _PIPELINE_DIR / "reports"
 NOTES_DIR = _PIPELINE_DIR / "notes"
 
-app = FastAPI(title="Research Pipeline API", version="1.0.0")
+async def _auto_schedule_loop() -> None:
+    """Background task: trigger pipeline daily at the configured time."""
+    await asyncio.sleep(30)  # wait for server to fully start
+    last_triggered_date: str = ""
+    while True:
+        try:
+            cfg = _load_config()
+            if cfg.get("auto_schedule_enabled"):
+                schedule_time = str(cfg.get("auto_schedule_time", "08:00")).strip()
+                tz_name = _normalize_timezone(str(cfg.get("timezone", "UTC")))
+                tz = ZoneInfo(tz_name)
+                now = datetime.now(tz)
+                today_str = now.strftime("%Y-%m-%d")
+                hhmm = now.strftime("%H:%M")
+                if hhmm == schedule_time and last_triggered_date != today_str:
+                    last_triggered_date = today_str
+                    with _pipeline_lock:
+                        already_running = _pipeline_state.get("status") == "running"
+                    if not already_running:
+                        try:
+                            from paper_archive import get_run as _get_run
+                            archive_db = cfg.get("archive_db", DEFAULT_ARCHIVE)
+                            already_run = _get_run(archive_db, today_str) is not None
+                        except Exception:
+                            already_run = False
+                        if not already_run:
+                            # Build a Settings object from saved config and call run_pipeline
+                            s = Settings(
+                                language=str(cfg.get("language", "en")),
+                                timezone=tz_name,
+                                journals=list(cfg.get("journals", [])),
+                                custom_journals=list(cfg.get("custom_journals", [])),
+                                fields=list(cfg.get("fields", [])),
+                                download_pdf=bool(cfg.get("download_pdf", True)),
+                                api_provider=str(cfg.get("api_provider", "gemini")),
+                                openai_api_key=str(cfg.get("openai_api_key", "")),
+                                gemini_api_key=str(cfg.get("gemini_api_key", "")),
+                                api_model=str(cfg.get("api_model", "gemini-2.5-flash-lite")),
+                                max_reports=int(cfg.get("max_reports", 5)),
+                                date_days=int(cfg.get("date_range_days", 3)),
+                                strict_journal=bool(cfg.get("strict_journal_only", True)),
+                                exclude_keywords=str(cfg.get("exclude_keywords", "")),
+                                webhook_url=str(cfg.get("webhook_url", "")),
+                                archive_db=str(cfg.get("archive_db", "")),
+                            )
+                            body = RunPipelineRequest(settings=s, force=False)
+                            run_pipeline(body)
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    task = asyncio.create_task(_auto_schedule_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Research Pipeline API", version="1.0.0", lifespan=lifespan)
 
 # ── Background pipeline task state ────────────────────────────────────────
 _pipeline_lock = threading.Lock()
@@ -1321,32 +1381,40 @@ def _generate_deep_md(
                 "Then output the review body (no YAML, no title line). Use ## for sections, ### for sub-sections.\n\n"
                 "REQUIRED SECTIONS — follow this exact order and section titles exactly, skip none:\n\n"
                 "## AI Summary\n"
-                "1 concise paragraph with the central idea, key result, and practical takeaway.\n\n"
+                "Write 2-3 paragraphs (~180-250 words total). "
+                "Para 1: What problem does this paper address and why does it matter? "
+                "Para 2: What is the core approach/idea and what makes it different? "
+                "Para 3: Key result and practical takeaway — who should care and why. "
+                "If the paper has 1-2 key equations central to understanding the method, embed them "
+                "using LaTeX ($...$ inline, $$...$$ display). Only include equations that are truly essential — skip if the method is better explained in words.\n\n"
                 "## Abstract\n"
                 "Rewrite the paper abstract in clearer language (1-2 paragraphs, factual, no hype).\n\n"
                 "## Method Details\n"
-                "This is the key section for understanding (about 180-260 words, clear and practical).\n"
+                "This is the key section — go deep and be technical (about 300-420 words).\n"
                 "### Overall Framework\n"
-                "Explain the core pipeline and key technical idea in plain language.\n"
+                "Explain the full pipeline: inputs, processing stages, outputs. What is the core insight that makes this work?\n"
                 "### Technical Components\n"
-                "Describe important modules, objectives/losses, and training setup (only what is essential).\n"
-                "Include compact math only when it helps understanding. Render equations with LaTeX:\n"
+                "Describe each important module in detail: architecture choices, objectives/loss functions, "
+                "training tricks, and why each design decision matters. "
+                "Include math where it aids understanding. Render equations with LaTeX:\n"
                 "- Inline equations: $...$\n"
                 "- Display equations: $$...$$\n"
                 "Never output raw LaTeX without $ delimiters.\n"
                 "### Data and Experimental Setup\n"
-                "Datasets, split, key metrics, and strongest baseline comparisons.\n\n"
+                "Datasets, splits, evaluation metrics, and the strongest baseline comparisons. "
+                "Note any important implementation details (compute, hyperparameters, ablation design).\n\n"
                 "## Main Results\n"
-                "Key quantitative findings (about 100-160 words). Cover: best numbers on main benchmarks, "
-                "most important comparisons vs baselines, and one or two notable ablation findings if available. "
+                "Detailed quantitative findings (about 180-250 words). Cover: "
+                "best numbers on all main benchmarks, most important comparisons vs baselines, "
+                "key ablation findings that validate design choices, and any surprising or negative results. "
                 "Be specific — include actual numbers (e.g. '+2.3% AUROC over prior SOTA'). "
                 "Embed a result figure here if one is available and clearly informative.\n\n"
                 "## Summary\n"
-                "Keep this short (80-150 words): what we learned and why it matters.\n\n"
+                "100-160 words: what we learned, why the method works, and broader implications.\n\n"
                 "## Future Direction\n"
-                "List concrete future work directions (2-4 bullets) and why each matters.\n\n"
+                "List 3-5 concrete future work directions with a sentence explaining why each matters.\n\n"
                 "## Pros and Cons\n"
-                "Use two subsections with bullet points:\n"
+                "Use two subsections with 3-5 bullet points each. Each bullet should be a full sentence with reasoning, not just a label.\n"
                 "### Pros\n"
                 "### Cons\n\n"
                 "DO NOT output any section for related work/articles; it will be appended separately.\n"
@@ -1807,6 +1875,8 @@ class Settings(BaseModel):
     exclude_keywords: str = ""
     webhook_url: str = ""
     archive_db: str = ""
+    auto_schedule_enabled: bool = False
+    auto_schedule_time: str = "08:00"
 
 
 class RunPipelineRequest(BaseModel):
@@ -1983,6 +2053,8 @@ def get_settings() -> dict[str, Any]:
         "archive_db": cfg.get("archive_db", DEFAULT_ARCHIVE),
         "journal_options": list(JOURNAL_OPTIONS),
         "field_options": list(FIELD_OPTIONS),
+        "auto_schedule_enabled": bool(cfg.get("auto_schedule_enabled", False)),
+        "auto_schedule_time": str(cfg.get("auto_schedule_time", "08:00")),
     }
 
 
@@ -2523,6 +2595,74 @@ async def summarize_paper(body: SummarizeRequest) -> dict[str, Any]:
         pass
 
     return {"ok": True, "report": report, "md_path": md_path, "card": card}
+
+
+class DemoteRequest(BaseModel):
+    date: str
+    card: dict[str, Any]
+
+
+@app.post("/api/papers/demote")
+def demote_paper(body: DemoteRequest) -> dict[str, Any]:
+    """Move a paper from report_cards back to also_notable, regenerate digest.md."""
+    date_str = body.date
+    card = dict(body.card)
+    pid = card.get("paper_id", "")
+    if not pid:
+        raise HTTPException(status_code=400, detail="Missing card.paper_id")
+
+    cfg = _load_config()
+    archive_db = cfg.get("archive_db", DEFAULT_ARCHIVE)
+
+    import sqlite3
+    try:
+        with sqlite3.connect(archive_db) as conn:
+            row = conn.execute(
+                "SELECT papers_json FROM runs WHERE run_date = ?", (date_str,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Run not found")
+            data = json.loads(row[0])
+            report_cards: list[dict] = data.get("report_cards", [])
+            also_notable: list[dict] = data.get("also_notable", [])
+
+            # Remove from report_cards
+            report_cards = [c for c in report_cards if c.get("paper_id") != pid]
+            # Add back to also_notable if not already there
+            if not any(c.get("paper_id") == pid for c in also_notable):
+                also_notable.insert(0, card)
+
+            data["report_cards"] = report_cards
+            data["also_notable"] = also_notable
+            conn.execute(
+                "UPDATE runs SET papers_json = ? WHERE run_date = ?",
+                (json.dumps(data, ensure_ascii=False), date_str),
+            )
+            conn.commit()
+
+        # Regenerate digest.md
+        try:
+            day_dir = REPORTS_DIR / date_str
+            day_dir.mkdir(parents=True, exist_ok=True)
+            _write_digest_md(date_str, report_cards, also_notable, day_dir)
+        except Exception:
+            pass
+
+        # Delete the .md report file if it exists
+        try:
+            slug = _safe_slug(card.get("title", ""))
+            md_file = REPORTS_DIR / date_str / f"{slug}.md"
+            if md_file.exists():
+                md_file.unlink()
+        except Exception:
+            pass
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"ok": True}
 
 
 @app.post("/api/papers/cache-pdf")

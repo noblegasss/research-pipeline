@@ -75,6 +75,8 @@ export interface AppSettings {
   archive_db: string;
   journal_options: string[];
   field_options: string[];
+  auto_schedule_enabled: boolean;
+  auto_schedule_time: string; // "HH:MM" in local timezone
 }
 
 export interface NetworkNode {
@@ -399,6 +401,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   archive_db: "",
   journal_options: JOURNAL_OPTIONS_DEFAULT,
   field_options: FIELD_OPTIONS_DEFAULT,
+  auto_schedule_enabled: false,
+  auto_schedule_time: "08:00",
 };
 
 // ── localStorage helpers ───────────────────────────────────────────────────
@@ -565,6 +569,17 @@ export const api = {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ date, card, settings }),
+      }
+    ),
+
+  /** Move a deep-read card back to also_notable */
+  demotePaper: (date: string, card: PaperCard) =>
+    apiFetch<{ ok: boolean }>(
+      `/api/papers/demote`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, card }),
       }
     ),
 

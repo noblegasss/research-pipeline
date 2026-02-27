@@ -422,6 +422,26 @@ export default function SettingsPage() {
                 placeholder="https://hooks.slack.com/…"
                 className="w-full text-sm border rounded-lg px-3 py-2 outline-none focus:border-blue-400" />
             </div>
+            <div>
+              <label className="text-xs font-medium text-gray-600 block mb-1.5">Auto-run Schedule</label>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" id="auto_schedule"
+                    checked={settings.auto_schedule_enabled}
+                    onChange={(e) => patch("auto_schedule_enabled", e.target.checked)}
+                    className="w-4 h-4 accent-blue-500" />
+                  <span className="text-sm text-gray-700">Run pipeline automatically every day at</span>
+                </label>
+                <input
+                  type="time"
+                  value={settings.auto_schedule_time}
+                  onChange={(e) => patch("auto_schedule_time", e.target.value)}
+                  disabled={!settings.auto_schedule_enabled}
+                  className="text-sm border rounded-lg px-2 py-1.5 outline-none focus:border-blue-400 disabled:opacity-40"
+                />
+              </div>
+              <p className="text-xs text-gray-400 mt-1">Uses your configured timezone. Skips if already run today.</p>
+            </div>
           </div>
         </Section>
       </div>

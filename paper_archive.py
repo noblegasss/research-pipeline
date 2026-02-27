@@ -270,3 +270,15 @@ def archive_size(db_path: str) -> int:
             return int(conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
     except Exception:
         return 0
+
+
+def get_known_paper_ids(db_path: str) -> set[str]:
+    """Return the set of all paper_ids already in the archive."""
+    if not Path(db_path).exists():
+        return set()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("SELECT paper_id FROM papers").fetchall()
+            return {r[0] for r in rows if r[0]}
+    except Exception:
+        return set()

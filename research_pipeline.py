@@ -45,7 +45,7 @@ _ROOT = Path(_os.environ.get(
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from paper_archive import archive_size, find_similar, init_archive, store_paper, store_run
+from paper_archive import archive_size, find_similar, get_known_paper_ids, init_archive, store_paper, store_run
 from app import (
     L,
     Paper,
@@ -242,24 +242,6 @@ def _build_slack_text(
 
             lines.append("")
 
-    if also_notable:
-        lines.append(L(lang, "━━ 其他值得关注 ━━", "━━ Also Notable ━━"))
-        lines.append("")
-        base = len(report_cards) + 1
-        for i, c in enumerate(also_notable, start=base):
-            title = c.get("title", "")
-            venue = c.get("venue", "")
-            date  = c.get("date", "")
-            link  = c.get("link", "")
-            summary = c.get("ai_feed_summary", "") or c.get("value_assessment", "")
-            head = f"{i}. {title} ({venue}, {date})"
-            if link:
-                head += f" | {link}"
-            lines.append(head)
-            if summary:
-                lines.append(f"   {summary}")
-            lines.append("")
-
     return "\n".join(lines)
 
 
@@ -324,6 +306,31 @@ def run_research_once(
     print(L(lang,
         f"[2/4] 归档库已就绪，当前收录 {prev_count} 篇历史论文",
         f"[2/4] Archive ready — {prev_count} historical papers"))
+
+    # ------------------------------------------------------------------
+    # 3b. Deduplicate — skip papers already in the archive
+    # ------------------------------------------------------------------
+    known_ids = get_known_paper_ids(archive_db)
+    if known_ids:
+        before = len(all_cards)
+        top_picks    = [c for c in top_picks    if c.get("paper_id", "") not in known_ids]
+        also_notable = [c for c in also_notable if c.get("paper_id", "") not in known_ids]
+        all_cards    = list(top_picks) + list(also_notable)
+        skipped = before - len(all_cards)
+        if skipped:
+            print(L(lang,
+                f"   去重：跳过 {skipped} 篇已归档论文",
+                f"   Dedup: skipped {skipped} already-archived papers"))
+
+    if not all_cards:
+        msg = L(lang,
+            "今日所有论文均已在归档库中，无新增内容。",
+            "All fetched papers already in archive — nothing new today.")
+        print(msg)
+        _deliver(webhook_override, settings, lang,
+                 date_str=datetime.now(UTC).strftime("%Y-%m-%d"),
+                 text=msg)
+        return True, msg
 
     # ------------------------------------------------------------------
     # 4. Select papers for detailed reports (top N by score)

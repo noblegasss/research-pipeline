@@ -11,12 +11,26 @@ type SearchItem = {
   tags: string[];
 };
 
+/** Normalize a tag: lowercase, collapse separators, strip punctuation */
+function normalizeTag(t: string): string {
+  return t.toLowerCase()
+    .replace(/[-_/\\|]+/g, " ")   // separators → space
+    .replace(/[^a-z0-9 ]/g, "")   // strip other punctuation
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Canonical display label: title-case words */
+function displayTag(norm: string): string {
+  return norm.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 export default function SearchPage() {
   const router = useRouter();
   const [items, setItems] = useState<SearchItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
-  const [activeTag, setActiveTag] = useState("");
+  const [activeTags, setActiveTags] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     queueMicrotask(() => setLoading(true));
@@ -52,20 +66,45 @@ export default function SearchPage() {
       .finally(() => setLoading(false));
   }, []);
 
-  const allTags = useMemo(
-    () => Array.from(new Set(items.flatMap((i) => i.tags))).sort((a, b) => a.localeCompare(b)),
+  // Deduplicated normalized tags, sorted by frequency then alpha
+  const { allTags, normMap } = useMemo(() => {
+    // normMap: normalized → count
+    const counts = new Map<string, number>();
+    for (const item of items) {
+      const seen = new Set<string>();
+      for (const t of item.tags) {
+        const n = normalizeTag(t);
+        if (!n || seen.has(n)) continue;
+        seen.add(n);
+        counts.set(n, (counts.get(n) ?? 0) + 1);
+      }
+    }
+    const sorted = [...counts.entries()]
+      .filter(([, c]) => c >= 1)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([n]) => n);
+    return { allTags: sorted, normMap: counts };
+  }, [items]);
+
+  // For each item, precompute its normalized tag set
+  const itemsWithNorm = useMemo(
+    () => items.map((i) => ({
+      ...i,
+      normTags: new Set(i.tags.map(normalizeTag).filter(Boolean)),
+    })),
     [items]
   );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return items.filter((i) => {
-      const text = `${i.title} ${i.date} ${(i.tags || []).join(" ")}`.toLowerCase();
+    return itemsWithNorm.filter((i) => {
+      const text = `${i.title} ${i.date} ${[...i.normTags].join(" ")}`.toLowerCase();
       const qOk = !q || text.includes(q);
-      const tagOk = !activeTag || (i.tags || []).includes(activeTag);
+      // OR logic: item must match at least one selected tag
+      const tagOk = activeTags.size === 0 || [...activeTags].some((t) => i.normTags.has(t));
       return qOk && tagOk;
     });
-  }, [items, query, activeTag]);
+  }, [itemsWithNorm, query, activeTags]);
 
   return (
     <div className="max-w-5xl mx-auto px-8 py-8">
@@ -83,21 +122,31 @@ export default function SearchPage() {
           />
           <div className="flex flex-wrap gap-1.5">
             <button
-              onClick={() => setActiveTag("")}
-              className={`text-xs px-2 py-1 rounded-full border ${activeTag === "" ? "bg-[#2f2c28] text-white border-[#2f2c28]" : "bg-white text-[#5f5a54] border-[#d9d4c9]"}`}
+              onClick={() => setActiveTags(new Set())}
+              className={`text-xs px-2 py-1 rounded-full border transition-colors ${activeTags.size === 0 ? "bg-[#2f2c28] text-white border-[#2f2c28]" : "bg-white text-[#5f5a54] border-[#d9d4c9]"}`}
             >
-              All tags
+              All
             </button>
-            {allTags.map((t) => (
+            {allTags.map((norm) => (
               <button
-                key={t}
-                onClick={() => setActiveTag((prev) => (prev === t ? "" : t))}
-                className={`text-xs px-2 py-1 rounded-full border ${activeTag === t ? "bg-blue-600 text-white border-blue-600" : "bg-white text-[#5f5a54] border-[#d9d4c9]"}`}
+                key={norm}
+                onClick={() => setActiveTags((prev) => {
+                  const next = new Set(prev);
+                  next.has(norm) ? next.delete(norm) : next.add(norm);
+                  return next;
+                })}
+                className={`text-xs px-2 py-1 rounded-full border transition-colors ${activeTags.has(norm) ? "bg-blue-600 text-white border-blue-600" : "bg-white text-[#5f5a54] border-[#d9d4c9]"}`}
+                title={`${normMap.get(norm)} paper${(normMap.get(norm) ?? 0) > 1 ? "s" : ""}`}
               >
-                #{t}
+                #{displayTag(norm)}
               </button>
             ))}
           </div>
+          {activeTags.size > 0 && (
+            <p className="text-xs text-[#8f887f]">
+              Showing papers matching <strong>any</strong> of {activeTags.size} selected tag{activeTags.size > 1 ? "s" : ""} · {filtered.length} result{filtered.length !== 1 ? "s" : ""}
+            </p>
+          )}
         </div>
       </div>
 
@@ -116,15 +165,15 @@ export default function SearchPage() {
             >
               <p className="text-sm font-semibold text-[#2e2b27]">{r.title}</p>
               <p className="text-xs text-[#8f887f] mt-1">{r.date}</p>
-              {r.tags.length > 0 && (
+              {r.normTags.size > 0 && (
                 <div className="flex flex-wrap gap-1 mt-2">
-                  {Array.from(new Set(r.tags)).slice(0, 8).map((t) => (
+                  {[...r.normTags].slice(0, 8).map((norm) => (
                     <span
-                      key={t}
-                      className="text-[11px] px-2 py-0.5 rounded-full border"
-                      style={{ background: "#eef2fb", color: "#3b5ea6", borderColor: "#c7d4f0" }}
+                      key={norm}
+                      className={`text-[11px] px-2 py-0.5 rounded-full border transition-colors ${activeTags.has(norm) ? "bg-blue-100 border-blue-300 text-blue-700" : ""}`}
+                      style={activeTags.has(norm) ? {} : { background: "#eef2fb", color: "#3b5ea6", borderColor: "#c7d4f0" }}
                     >
-                      #{t}
+                      #{displayTag(norm)}
                     </span>
                   ))}
                 </div>
