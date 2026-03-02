@@ -24,12 +24,22 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 # ── Python path ────────────────────────────────────────────────────────────
-_ROOT = Path(os.environ.get(
-    "RESEARCH_PUSH_ROOT",
-    str(Path(__file__).resolve().parent.parent.parent / "research_push"),
-))
+_parent_of_pipeline = Path(__file__).resolve().parent.parent.parent
+_ROOT = Path(os.environ.get("RESEARCH_PUSH_ROOT", ""))
+if not _ROOT.is_dir():
+    # Try both naming conventions: research_push (underscore) and research-push (hyphen)
+    for name in ("research_push", "research-push"):
+        candidate = _parent_of_pipeline / name
+        if candidate.is_dir():
+            _ROOT = candidate
+            break
+    else:
+        _ROOT = _parent_of_pipeline / "research_push"
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+if not (_ROOT / "app.py").exists():
+    print(f"WARNING: research_push not found at {_ROOT}")
+    print("Please clone it as a sibling: git clone https://github.com/noblegasss/research-push.git research_push")
 
 _PIPELINE_DIR = Path(__file__).resolve().parent.parent
 if str(_PIPELINE_DIR) not in sys.path:
