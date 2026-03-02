@@ -16,7 +16,8 @@ from typing import Any, AsyncGenerator
 
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+UTC = timezone.utc
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
