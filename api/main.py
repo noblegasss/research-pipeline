@@ -2779,6 +2779,9 @@ def get_network(
             pid, title, venue, pub_date, wbag = row[0], row[1], row[2], row[3], row[4]
             abstract = row[5] if len(row) > 5 else ""
             link = _best_link({"paper_id": pid or ""})
+            if not link and title:
+                from urllib.parse import quote_plus
+                link = f"https://scholar.google.com/scholar?q={quote_plus(title)}"
             v_parts = (venue or "").split()
             nodes.append({
                 "id": pid or title or "",

@@ -10,15 +10,31 @@ An AI-powered daily research reading assistant. Set your journals and fields of 
 
 Each pipeline run:
 
-1. **Fetches** newly published papers from your selected journals (Nature, Science, bioRxiv, etc.) and arXiv fields
-2. **Scores** each paper on relevance, novelty, rigor, and impact using AI
-3. **Selects** the top papers as deep reads (configurable limit)
-4. **Generates** structured Markdown reports with:
-   - AI Summary, Method Details, Main Results, Pros/Cons
+1. **Fetches** newly published papers from your selected journals (Nature, Science, Cell, bioRxiv, arXiv, etc.) via Crossref, PubMed, RSS, and arXiv APIs
+2. **Deduplicates** against your personal archive — never see the same paper twice
+3. **Scores** each paper on relevance, novelty, rigor, and impact using AI
+4. **Selects** the top papers as deep reads (configurable limit)
+5. **Generates** structured reports with:
+   - AI Summary (2–3 paragraphs with key equations in LaTeX)
+   - Method Details, Main Results, Pros/Cons, Future Directions
    - Figures extracted from arXiv HTML or PDFs, classified as method vs. result
-   - LaTeX math rendering (KaTeX)
+   - KaTeX math rendering
    - Related papers from your personal archive
-5. **Saves** everything locally — reports, notes, and a growing SQLite archive
+6. **Saves** everything locally — reports, notes, and a growing SQLite archive
+7. **Notifies** via Slack with a daily digest (optional)
+
+---
+
+## Features
+
+- **70+ journals supported** — Nature family, Science family, Cell family, Lancet, JAMA, NEJM, PNAS, eLife, bioRxiv, medRxiv, arXiv, Alzheimer's journals, aging journals, and more
+- **Smart journal matching** — abbreviations and aliases are handled automatically (e.g. "Nat Med" → Nature Medicine, "Proc Natl Acad Sci" → PNAS)
+- **Auto-schedule** — set a daily time and the pipeline runs automatically
+- **Paper network graph** — D3.js interactive visualization of paper similarity (Jaccard + Gaussian kernel)
+- **Demote papers** — move a deep read back to "also notable" if it's not relevant
+- **Tag-based search** — multi-select tags with OR logic, normalized and deduplicated
+- **Reading notes** — Obsidian-compatible markdown notes per paper
+- **PWA support** — installable as a native app on macOS / Chrome
 
 ---
 
@@ -45,7 +61,7 @@ Each pipeline run:
 - Node.js 18+ and npm
 - An OpenAI or Gemini API key
 
-This project uses [`research_push`](https://github.com/noblegasss/research_push) for paper fetching. Clone it as a sibling directory:
+This project uses [`research_push`](https://github.com/noblegasss/research-push) for paper fetching. Clone it as a sibling directory:
 
 ```
 parent/
@@ -60,32 +76,47 @@ parent/
 ### 1. Clone both repos
 
 ```bash
-git clone https://github.com/noblegasss/research_push
-git clone https://github.com/noblegasss/research_pipeline
+git clone https://github.com/noblegasss/research-push.git research_push
+git clone https://github.com/noblegasss/research-pipeline.git research_pipeline
 ```
 
-### 2. Backend
+### 2. Install dependencies
 
 ```bash
 cd research_pipeline
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn api.main:app --host 0.0.0.0 --port 8010 --reload
+cd web && npm install && cd ..
 ```
 
-### 3. Frontend
+### 3. Start services
+
+**Option A: PM2 (recommended — auto-restart, background)**
 
 ```bash
-cd web
-npm install
-echo "BACKEND_API_BASE=http://127.0.0.1:8010" > .env.local
-npm run dev
+npm install -g pm2
+pm2 start ecosystem.config.cjs
+pm2 save
 ```
 
-### 4. Run
+**Option B: One-command script**
 
-1. Open `http://localhost:3000`
+```bash
+./start.sh
+```
+
+**Option C: Manual**
+
+```bash
+# Terminal 1 — API
+uvicorn api.main:app --host 127.0.0.1 --port 8010 --reload
+
+# Terminal 2 — Frontend
+cd web && npm run dev -- -p 3010
+```
+
+### 4. Use
+
+1. Open `http://localhost:3010`
 2. Go to **Settings**
 3. Enter your AI provider and API key (Gemini or OpenAI)
 4. Select journals and research fields
@@ -102,12 +133,13 @@ All settings are managed through the web UI (**Settings** page) and saved locall
 | **AI Provider** | `gemini` or `openai` |
 | **API Key** | Your provider's API key |
 | **Model** | e.g. `gemini-2.5-flash`, `gpt-4.1-mini` |
-| **Journals** | Nature, Science, NEJM, bioRxiv, Cell, and more |
-| **Fields** | AI, Bioinformatics, Aging, Oncology, etc. |
+| **Journals** | Nature, Science, Cell, NEJM, bioRxiv, arXiv, and 70+ more |
+| **Fields** | AI, Bioinformatics, Aging, Oncology, Genomics, etc. |
 | **Max Reports** | Number of deep-read reports per run |
 | **Date Range** | How many days back to look for new papers |
 | **Download PDF** | Auto-download PDFs and extract figures |
-| **Slack Webhook** | Optional — post a daily digest to Slack |
+| **Slack Webhook** | Optional — post deep-read digest to Slack |
+| **Auto-schedule** | Daily auto-run at a configured time |
 
 ---
 
@@ -115,17 +147,19 @@ All settings are managed through the web UI (**Settings** page) and saved locall
 
 ```
 api/                   FastAPI backend + pipeline orchestration
-  main.py              All API routes and report generation logic
-web/                   Next.js frontend
+  main.py              All API routes, report generation, scheduler
+web/                   Next.js frontend (PWA-enabled)
   app/
     runs/              Daily pipeline run history
     reports/           Per-paper deep report pages
-    network/           Interactive paper similarity graph
+    network/           Interactive paper similarity graph (D3.js)
     notes/             Obsidian-compatible reading notes
-    search/            Full-text archive search
+    search/            Full-text archive search with tag filtering
     settings/          Configuration UI
 paper_archive.py       SQLite archive utilities
-research_pipeline.py   CLI pipeline runner
+research_pipeline.py   CLI pipeline runner + Slack integration
+ecosystem.config.cjs   PM2 process manager config
+start.sh               One-command startup script
 pipeline_config.json   Local config (gitignored)
 ```
 
@@ -133,7 +167,7 @@ pipeline_config.json   Local config (gitignored)
 
 ## Secrets & Security
 
-`pipeline_config.json` stores your API keys locally and is gitignored by default. **Do not commit it.** See `.env.example` for optional environment variable overrides.
+`pipeline_config.json` stores your API keys locally and is gitignored by default. **Do not commit it.**
 
 ---
 

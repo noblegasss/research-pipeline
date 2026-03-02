@@ -206,7 +206,7 @@ export default function RunPage({ params }: { params: Promise<{ date: string }> 
         <div>
           <h1 className="text-2xl font-bold text-[#1f1d1a] mb-2">{date}</h1>
           <div className="flex flex-wrap gap-4 text-sm text-[#7e776e]">
-            <span>📄 <strong className="text-[#302d29]">{total_count}</strong> papers today</span>
+            <span>📄 <strong className="text-[#302d29]">{allReportCards.length + notable.length}</strong> papers</span>
             <span>📑 <strong className="text-[#302d29]">{allReportCards.length}</strong> deep reads</span>
             <span>📋 <strong className="text-[#302d29]">{notable.length}</strong> also notable</span>
           </div>

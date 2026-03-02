@@ -48,7 +48,7 @@ function TagList({
     <div ref={containerRef}>
       {/* Selected tags */}
       <div className="flex flex-wrap gap-1.5 mb-2 min-h-[28px]">
-        {items.map((item) => (
+        {[...new Set(items)].map((item) => (
           <span key={item}
             className="flex items-center gap-1 text-xs bg-blue-50 text-blue-800 border border-blue-200 px-2 py-1 rounded-full">
             {item}
@@ -142,21 +142,42 @@ export default function SettingsPage() {
   // Track whether the initial load is done so we don't auto-save before reading
   const initializedRef = useRef(false);
 
-  // Load from localStorage immediately, then merge backend in background
+  // Load settings: try backend first (source of truth), fallback to localStorage
   useEffect(() => {
     const local = loadLocalSettings();
-    setSettings(local);
-    api.getSettings().then((merged) => {
-      setSettings(merged);
-      setBackendOk(true);
-    }).catch(() => setBackendOk(false))
-      .finally(() => { initializedRef.current = true; });
+    setSettings(local);               // show local instantly while backend loads
+
+    let retries = 0;
+    const maxRetries = 3;
+
+    function tryBackend() {
+      api.getSettings().then((remote) => {
+        // Backend is source of truth — always use it
+        setSettings(remote);
+        saveLocalSettings(remote);     // sync localStorage with backend
+        setBackendOk(true);
+        initializedRef.current = true;
+      }).catch(() => {
+        retries++;
+        if (retries < maxRetries) {
+          // Backend might still be starting — retry after delay
+          setTimeout(tryBackend, 2000);
+        } else {
+          // Backend truly unreachable — keep localStorage, don't allow auto-save
+          setBackendOk(false);
+          initializedRef.current = true;
+        }
+      });
+    }
+    tryBackend();
   }, []);
 
   // Auto-save to localStorage on every settings change (after initial load)
   useEffect(() => {
     if (!settings) return;
     if (!initializedRef.current) return;
+    // Don't save if journals & fields are both empty — likely a failed load
+    if (settings.journals.length === 0 && settings.fields.length === 0) return;
     saveLocalSettings(settings);
   }, [settings]);
 

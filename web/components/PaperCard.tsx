@@ -94,7 +94,7 @@ export default function PaperCard({ card, index, defaultOpen = false, date, onDe
   const hasOverflow = Boolean(pdfLink || (date && onDemoted));
 
   return (
-    <article className="border rounded-xl mb-3 overflow-hidden transition-all hover:-translate-y-[1px]"
+    <article className="border rounded-xl mb-3 transition-all hover:-translate-y-[1px]"
       style={{ borderColor: "var(--card-border)", background: "#fcfbf8", boxShadow: "0 6px 18px rgba(23,19,14,0.06)" }}>
       {/* Header */}
       <header

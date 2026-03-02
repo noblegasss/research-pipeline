@@ -489,18 +489,18 @@ export interface NoteDetail {
 }
 
 export const api = {
-  /** Load settings: localStorage is the source of truth.
-   *  Backend is only consulted to fill archive_db if not set locally. */
+  /** Load settings: backend is the source of truth.
+   *  Falls back to localStorage only when backend is unreachable. */
   getSettings: async (): Promise<AppSettings> => {
     const local = loadLocalSettings();
     try {
       const remote = await apiFetch<AppSettings>("/api/settings");
-      // Only borrow archive_db from backend as a fallback (server-side path)
+      // Backend is source of truth — use remote, fill in defaults for missing fields
       const merged: AppSettings = {
-        ...local,
-        archive_db: local.archive_db || remote.archive_db,
-        journal_options: JOURNAL_OPTIONS_DEFAULT,
-        field_options: FIELD_OPTIONS_DEFAULT,
+        ...DEFAULT_SETTINGS,
+        ...remote,
+        journal_options: remote.journal_options?.length ? remote.journal_options : JOURNAL_OPTIONS_DEFAULT,
+        field_options: remote.field_options?.length ? remote.field_options : FIELD_OPTIONS_DEFAULT,
       };
       return merged;
     } catch {
