@@ -499,8 +499,9 @@ export const api = {
       const merged: AppSettings = {
         ...DEFAULT_SETTINGS,
         ...remote,
-        journal_options: remote.journal_options?.length ? remote.journal_options : JOURNAL_OPTIONS_DEFAULT,
-        field_options: remote.field_options?.length ? remote.field_options : FIELD_OPTIONS_DEFAULT,
+        // Option lists are static dropdown choices — always use the full frontend defaults
+        journal_options: JOURNAL_OPTIONS_DEFAULT,
+        field_options: FIELD_OPTIONS_DEFAULT,
       };
       return merged;
     } catch {
