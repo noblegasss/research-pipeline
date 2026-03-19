@@ -15,8 +15,9 @@ module.exports = {
     {
       name: "research-web",
       cwd: path.join(DIR, "web"),
-      script: "node_modules/.bin/next",
-      args: "dev -p 3010",
+      script: "npx",
+      args: "next dev -p 3010",
+      interpreter: "none",
       autorestart: true,
       max_restarts: 10,
     },

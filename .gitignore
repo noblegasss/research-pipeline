@@ -36,5 +36,10 @@ pipeline_config.json
 .idea/
 .vscode/
 
+# Synthesis / drafts (local only)
+synthesis_bridge.py
+synthesis_output/
+paper_draft*.md
+
 # Logs
 *.log
